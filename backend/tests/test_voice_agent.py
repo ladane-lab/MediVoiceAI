@@ -345,7 +345,7 @@ def test_mocked_pipecat_pipeline_and_tools_schema(isolated_db):
     configured_settings = Settings(
         _env_file=None,
         gemini_api_key="test-gemini-key",
-        gemini_model="gemini-2.5-flash",
+        gemini_model="gemini-3.6-flash",
         elevenlabs_api_key="test-elevenlabs-key",
         elevenlabs_voice_id="test-voice-id",
     )

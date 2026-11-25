@@ -21,12 +21,12 @@ class Settings(BaseSettings):
 
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     database_url: str = "sqlite:///./medivoice.db"
 
     # AI and voice provider keys (configured for Phase 2+)
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.6-flash"
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
     voice_ice_servers: str = "stun:stun.l.google.com:19302"
