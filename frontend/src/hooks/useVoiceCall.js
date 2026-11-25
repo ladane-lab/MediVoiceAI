@@ -51,13 +51,20 @@ function waitForIceGathering(pc, timeoutMs = 1200) {
  * Reusable WebRTC voice hook connecting the browser directly to Pipecat's
  * SmallWebRTC signaling endpoints and real-time audio/data channels.
  */
-export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = {}) {
+export default function useVoiceCall({
+  onAttachRemoteStream,
+  onPlayRemoteAudio,
+  onClearRemoteStream,
+  onAppointmentUpdated,
+} = {}) {
   const [status, setStatus] = useState("idle"); // idle | connecting | connected | reconnecting | disconnected | ended | error
   const [isMuted, setIsMuted] = useState(false);
   const [durationSeconds, setDurationSeconds] = useState(0);
   const [transcript, setTranscript] = useState([]);
   const [userSpeaking, setUserSpeaking] = useState(false);
   const [assistantSpeaking, setAssistantSpeaking] = useState(false);
+  const [pipelineStage, setPipelineStage] = useState("listening"); // listening | thinking | speaking | error
+  const [audioPlaybackBlocked, setAudioPlaybackBlocked] = useState(false);
   const [micLevel, setMicLevel] = useState(null);
   const [errorMessage, setErrorMessage] = useState("");
   const [sessionId, setSessionId] = useState(null);
@@ -74,10 +81,16 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
   const audioContextRef = useRef(null);
   const meterFrameRef = useRef(null);
   const onAppointmentUpdatedRef = useRef(onAppointmentUpdated);
+  const onAttachRemoteStreamRef = useRef(onAttachRemoteStream);
+  const onPlayRemoteAudioRef = useRef(onPlayRemoteAudio);
+  const onClearRemoteStreamRef = useRef(onClearRemoteStream);
 
   useEffect(() => {
     onAppointmentUpdatedRef.current = onAppointmentUpdated;
-  }, [onAppointmentUpdated]);
+    onAttachRemoteStreamRef.current = onAttachRemoteStream;
+    onPlayRemoteAudioRef.current = onPlayRemoteAudio;
+    onClearRemoteStreamRef.current = onClearRemoteStream;
+  }, [onAppointmentUpdated, onAttachRemoteStream, onClearRemoteStream, onPlayRemoteAudio]);
 
   const stopAudioMeter = useCallback(() => {
     if (meterFrameRef.current) {
@@ -158,6 +171,9 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
           timestamp: payload.timestamp || null,
         });
       } else if (payload.type === "activity") {
+        if (payload.stage) {
+          setPipelineStage(payload.stage);
+        }
         if (payload.speaker === "user") {
           setUserSpeaking(Boolean(payload.speaking));
         } else if (payload.speaker === "assistant") {
@@ -166,6 +182,7 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
       } else if (payload.type === "appointment_updated") {
         onAppointmentUpdatedRef.current?.(payload);
       } else if (payload.type === "error" && payload.message) {
+        setPipelineStage("error");
         setErrorMessage(payload.message);
       }
     },
@@ -202,15 +219,15 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
       localStreamRef.current = null;
     }
 
-    if (remoteAudioRef?.current) {
-      remoteAudioRef.current.srcObject = null;
-    }
+    onClearRemoteStreamRef.current?.();
 
     pendingIceRef.current = [];
     pcIdRef.current = null;
     setUserSpeaking(false);
     setAssistantSpeaking(false);
-  }, [remoteAudioRef, stopAudioMeter]);
+    setPipelineStage("listening");
+    setAudioPlaybackBlocked(false);
+  }, [stopAudioMeter]);
 
   const endCall = useCallback(async () => {
     if (endingRef.current) return;
@@ -250,10 +267,15 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
     setTranscript([]);
     setDurationSeconds(0);
     setIsMuted(false);
+    setPipelineStage("listening");
+    setAudioPlaybackBlocked(false);
     isMutedRef.current = false;
     setStatus("connecting");
 
     try {
+      // Prime remote audio element inside the Start Call click gesture to satisfy browser autoplay rules
+      onPlayRemoteAudioRef.current?.()?.catch(() => {});
+
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error(
           "Your browser does not support WebRTC microphone access. Use Chrome, Edge, or Firefox over localhost or HTTPS.",
@@ -295,11 +317,22 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
       });
 
       pc.ontrack = (event) => {
-        const audioEl = remoteAudioRef?.current;
-        if (!audioEl) return;
         const [stream] = event.streams;
-        audioEl.srcObject = stream || new MediaStream([event.track]);
-        audioEl.play().catch(() => {});
+        const remoteStream = stream || new MediaStream([event.track]);
+        onAttachRemoteStreamRef.current?.(remoteStream);
+        const playPromise = onPlayRemoteAudioRef.current?.();
+        if (playPromise && typeof playPromise.then === "function") {
+          playPromise
+            .then(() => {
+              setAudioPlaybackBlocked(false);
+            })
+            .catch(() => {
+              setAudioPlaybackBlocked(true);
+              setErrorMessage(
+                "Browser blocked automatic audio playback. Click 'Enable Speaker Audio' below to hear MediVoice AI.",
+              );
+            });
+        }
       };
 
       pc.onicecandidate = (event) => {
@@ -388,7 +421,7 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
     } finally {
       startingRef.current = false;
     }
-  }, [cleanupPeerResources, handlePipelineEvent, remoteAudioRef, startAudioMeter, status]);
+  }, [cleanupPeerResources, handlePipelineEvent, startAudioMeter, status]);
 
   const toggleMute = useCallback(() => {
     if (!localStreamRef.current) return;
@@ -400,6 +433,16 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
     setIsMuted(nextMuted);
     if (nextMuted) {
       setUserSpeaking(false);
+    }
+  }, []);
+
+  const enableSpeakerAudio = useCallback(async () => {
+    try {
+      await onPlayRemoteAudioRef.current?.();
+      setAudioPlaybackBlocked(false);
+      setErrorMessage("");
+    } catch {
+      setAudioPlaybackBlocked(true);
     }
   }, []);
 
@@ -425,6 +468,10 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
         const summary = await fetchVoiceSessionSummary(sessionId);
         if (Array.isArray(summary?.transcript)) {
           summary.transcript.forEach(upsertTranscriptEntry);
+        }
+        if (summary?.error) {
+          setPipelineStage("error");
+          setErrorMessage(summary.error);
         }
       } catch {
         // Ignore transient polling failures
@@ -458,11 +505,14 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
     transcript,
     userSpeaking,
     assistantSpeaking,
+    pipelineStage,
+    audioPlaybackBlocked,
     micLevel,
     errorMessage,
     sessionId,
     startCall,
     endCall,
     toggleMute,
+    enableSpeakerAudio,
   };
 }

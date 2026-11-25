@@ -3,8 +3,10 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import logging
 from typing import Any
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -36,6 +38,8 @@ from app.config import Settings
 from app.voice.prompts import build_system_prompt
 from app.voice.tools import VoiceConversationState, build_voice_tools
 
+logger = logging.getLogger(__name__)
+
 
 class VoiceConfigurationError(Exception):
     """Raised when required Gemini or ElevenLabs credentials are missing."""
@@ -55,12 +59,35 @@ def validate_voice_configuration(settings: Settings) -> None:
         raise VoiceConfigurationError(missing)
 
 
+def sanitize_pipeline_error(raw_error: str) -> str:
+    """Map raw provider errors to safe, user-friendly messages without leaking secrets."""
+    lower = (raw_error or "").lower()
+    if "429" in lower or "resource_exhausted" in lower or "quota" in lower or "rate_limit" in lower:
+        return (
+            "The AI service rate or daily quota limit was reached. "
+            "Wait a moment or switch GEMINI_MODEL in .env and try again."
+        )
+    if "402" in lower or "payment_required" in lower or "library voices" in lower:
+        return (
+            "ElevenLabs TTS rejected the configured voice on your current plan. "
+            "Check ELEVENLABS_VOICE_ID in .env."
+        )
+    if "401" in lower or "403" in lower or "unauthorized" in lower or "api key" in lower or "auth" in lower:
+        return "Voice service authentication failed. Verify your backend API keys in .env."
+    if "503" in lower or "unavailable" in lower or "high demand" in lower:
+        return "The Gemini model is temporarily overloaded (503). Please speak again in a few seconds."
+    if "404" in lower or "not_found" in lower:
+        return "Configured Gemini model was not found. Check GEMINI_MODEL in .env."
+    return "The voice assistant encountered a temporary service error. Please try again."
+
+
 class UserTurnTranscriptObserver(FrameProcessor):
     """
-    Observes finalized ElevenLabs STT TranscriptionFrames.
+    Observes finalized ElevenLabs STT TranscriptionFrames and upstream ErrorFrames.
 
-    Advances VoiceConversationState for caller confirmation checks and emits
-    caller transcript events to the browser over WebRTC DataChannel.
+    Advances VoiceConversationState for caller confirmation checks, transitions the
+    UI into 'thinking' once speech is recognized, and forwards any upstream provider
+    errors (e.g. Gemini 429/503 or ElevenLabs TTS errors) to the browser.
     """
 
     def __init__(
@@ -73,31 +100,46 @@ class UserTurnTranscriptObserver(FrameProcessor):
         self._on_event = on_event
         self._seq = 0
 
+    def _emit(self, payload: dict[str, Any]) -> None:
+        if self._on_event is not None:
+            self._on_event(payload)
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
             cleaned = frame.text.strip()
             self._seq += 1
             turn_id = f"user-{self._seq}"
+            logger.info(
+                "Pipeline stage=stt_committed turn_id=%s chars=%d",
+                turn_id,
+                len(cleaned),
+            )
             self._state.record_user_turn(cleaned, turn_id=turn_id)
-            if self._on_event is not None:
-                self._on_event(
-                    {
-                        "type": "transcript",
-                        "id": turn_id,
-                        "role": "user",
-                        "text": cleaned,
-                        "final": True,
-                        "timestamp": datetime.now(UTC).isoformat(),
-                    }
-                )
+            self._emit(
+                {
+                    "type": "transcript",
+                    "id": turn_id,
+                    "role": "user",
+                    "text": cleaned,
+                    "final": True,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
+            self._emit({"type": "activity", "stage": "thinking", "speaker": "assistant", "speaking": False})
+        elif isinstance(frame, ErrorFrame):
+            friendly = sanitize_pipeline_error(str(getattr(frame, "error", "")))
+            logger.error("Pipeline ErrorFrame caught (direction=%s): %s", direction.name, friendly)
+            self._emit({"type": "error", "stage": "error", "message": friendly})
+
         await self.push_frame(frame, direction)
 
 
 class AssistantEventsObserver(FrameProcessor):
     """
-    Captures Gemini response text frames and user VAD speaking state
-    to emit live assistant transcripts and speaking indicators.
+    Captures Gemini response text frames, user VAD speaking state, and any
+    downstream ErrorFrames to emit live transcripts and Listening/Thinking state.
     """
 
     def __init__(self, on_event: Callable[[dict[str, Any]], None] | None = None):
@@ -115,13 +157,17 @@ class AssistantEventsObserver(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, UserStartedSpeakingFrame):
-            self._emit({"type": "activity", "speaker": "user", "speaking": True})
+            logger.info("Pipeline stage=vad_user_started")
+            self._emit({"type": "activity", "stage": "listening", "speaker": "user", "speaking": True})
         elif isinstance(frame, UserStoppedSpeakingFrame):
-            self._emit({"type": "activity", "speaker": "user", "speaking": False})
+            logger.info("Pipeline stage=vad_user_stopped")
+            self._emit({"type": "activity", "stage": "thinking", "speaker": "user", "speaking": False})
         elif isinstance(frame, LLMFullResponseStartFrame):
             self._turn_seq += 1
             self._current_turn_id = f"assistant-{self._turn_seq}"
             self._buffer = ""
+            logger.info("Pipeline stage=llm_response_start turn_id=%s", self._current_turn_id)
+            self._emit({"type": "activity", "stage": "thinking", "speaker": "assistant", "speaking": False})
         elif isinstance(frame, LLMTextFrame):
             if self._current_turn_id is None:
                 self._turn_seq += 1
@@ -141,6 +187,11 @@ class AssistantEventsObserver(FrameProcessor):
                 )
         elif isinstance(frame, LLMFullResponseEndFrame):
             if self._current_turn_id and self._buffer.strip():
+                logger.info(
+                    "Pipeline stage=llm_response_end turn_id=%s chars=%d",
+                    self._current_turn_id,
+                    len(self._buffer.strip()),
+                )
                 self._emit(
                     {
                         "type": "transcript",
@@ -153,14 +204,10 @@ class AssistantEventsObserver(FrameProcessor):
                 )
             self._current_turn_id = None
             self._buffer = ""
-
         elif isinstance(frame, ErrorFrame):
-            self._emit(
-                {
-                    "type": "error",
-                    "message": "The voice assistant encountered a temporary service error. Please try again.",
-                }
-            )
+            friendly = sanitize_pipeline_error(str(getattr(frame, "error", "")))
+            logger.error("Pipeline downstream ErrorFrame: %s", friendly)
+            self._emit({"type": "error", "stage": "error", "message": friendly})
 
         await self.push_frame(frame, direction)
 
@@ -176,9 +223,15 @@ class BotSpeakingObserver(FrameProcessor):
         await super().process_frame(frame, direction)
         if self._on_event is not None:
             if isinstance(frame, BotStartedSpeakingFrame):
-                self._on_event({"type": "activity", "speaker": "assistant", "speaking": True})
+                logger.info("Pipeline stage=tts_speaking_started")
+                self._on_event(
+                    {"type": "activity", "stage": "speaking", "speaker": "assistant", "speaking": True}
+                )
             elif isinstance(frame, BotStoppedSpeakingFrame):
-                self._on_event({"type": "activity", "speaker": "assistant", "speaking": False})
+                logger.info("Pipeline stage=tts_speaking_stopped")
+                self._on_event(
+                    {"type": "activity", "stage": "listening", "speaker": "assistant", "speaking": False}
+                )
         await self.push_frame(frame, direction)
 
 
@@ -242,6 +295,7 @@ def build_voice_pipeline(
             model=settings.gemini_model,
             system_instruction=system_prompt,
         ),
+        retry_on_timeout=True,
     )
 
     context = LLMContext(
@@ -260,7 +314,10 @@ def build_voice_pipeline(
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(stop_secs=0.6),
+            ),
+            user_turn_stop_timeout=1.5,
         ),
     )
 

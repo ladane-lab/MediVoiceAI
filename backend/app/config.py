@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # AI and voice provider keys (configured for Phase 2+)
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.6-flash"
+    gemini_model: str = "gemini-3.5-flash-lite"
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
     voice_ice_servers: str = "stun:stun.l.google.com:19302"

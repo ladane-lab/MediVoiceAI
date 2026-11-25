@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import asyncio
 from fastapi.testclient import TestClient
 from pipecat.frames.frames import (
+    ErrorFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
@@ -345,7 +346,7 @@ def test_mocked_pipecat_pipeline_and_tools_schema(isolated_db):
     configured_settings = Settings(
         _env_file=None,
         gemini_api_key="test-gemini-key",
-        gemini_model="gemini-3.6-flash",
+        gemini_model="gemini-3.5-flash-lite",
         elevenlabs_api_key="test-elevenlabs-key",
         elevenlabs_voice_id="test-voice-id",
     )
@@ -635,5 +636,29 @@ def test_booking_failure_communicated_truthfully(isolated_db):
     assert duplicate["success"] is False
     assert duplicate["error_code"] == "duplicate_booking"
     assert "already booked" in duplicate["error"].lower()
+
+
+def test_upstream_error_frame_forwarded_and_sanitized():
+    """Verify upstream Gemini/ElevenLabs ErrorFrames reach the session and DataChannel cleanly."""
+    mock_conn = MagicMock()
+    record = VoiceSessionRecord(session_id="sess-err", connection=mock_conn)
+    user_obs = UserTurnTranscriptObserver(record.state, on_event=record.record_and_emit_event)
+    user_obs.push_frame = MagicMock(side_effect=lambda f, d: asyncio.sleep(0))
+
+    async def _run():
+        await user_obs.process_frame(
+            ErrorFrame("ClientError 429 RESOURCE_EXHAUSTED quota exceeded api_key=SECRET"),
+            FrameDirection.UPSTREAM,
+        )
+
+    asyncio.run(_run())
+
+    assert record.error is not None
+    assert "quota" in record.error.lower()
+    assert "SECRET" not in record.error
+    sent_payload = mock_conn.send_app_message.call_args[0][0]
+    assert sent_payload["type"] == "error"
+    assert sent_payload["stage"] == "error"
+
 
 

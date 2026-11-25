@@ -84,8 +84,32 @@ export default function Home() {
 
   const remoteAudioRef = useRef(null);
 
+  const attachRemoteStream = useCallback((stream) => {
+    const el = remoteAudioRef.current;
+    if (!el) return;
+    el.srcObject = stream;
+    el.muted = false;
+    el.volume = 1.0;
+  }, []);
+
+  const playRemoteAudio = useCallback(() => {
+    const el = remoteAudioRef.current;
+    if (!el) return Promise.resolve();
+    el.muted = false;
+    el.volume = 1.0;
+    return el.play();
+  }, []);
+
+  const clearRemoteStream = useCallback(() => {
+    const el = remoteAudioRef.current;
+    if (!el) return;
+    el.srcObject = null;
+  }, []);
+
   const voiceCall = useVoiceCall({
-    remoteAudioRef,
+    onAttachRemoteStream: attachRemoteStream,
+    onPlayRemoteAudio: playRemoteAudio,
+    onClearRemoteStream: clearRemoteStream,
     onAppointmentUpdated: handleVoiceAppointmentUpdated,
   });
 

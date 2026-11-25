@@ -41,11 +41,14 @@ export default function VoiceAssistantCard({
     transcript,
     userSpeaking,
     assistantSpeaking,
+    pipelineStage,
+    audioPlaybackBlocked,
     micLevel,
     errorMessage,
     startCall,
     endCall,
     toggleMute,
+    enableSpeakerAudio,
   } = voiceCall;
 
   const transcriptEndRef = useRef(null);
@@ -61,13 +64,17 @@ export default function VoiceAssistantCard({
   const activityLabel =
     status !== "connected"
       ? statusInfo.label
-      : assistantSpeaking
-        ? "MediVoice AI is speaking..."
-        : isMuted
-          ? "Microphone muted"
-          : userSpeaking
-            ? "Listening to your voice..."
-            : "Listening — speak whenever ready";
+      : pipelineStage === "error"
+        ? "Voice pipeline error"
+        : assistantSpeaking || pipelineStage === "speaking"
+          ? "Speaking — MediVoice AI is responding..."
+          : pipelineStage === "thinking"
+            ? "Thinking — generating response..."
+            : isMuted
+              ? "Microphone muted"
+              : userSpeaking
+                ? "Listening — hearing your voice..."
+                : "Listening — speak whenever ready";
 
   return (
     <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
@@ -148,9 +155,20 @@ export default function VoiceAssistantCard({
       ) : null}
 
       {errorMessage ? (
-        <div className="mt-4 flex items-start gap-2.5 rounded-xl border border-rose-200 bg-rose-50 p-3.5 text-xs text-rose-800">
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
-          <p>{errorMessage}</p>
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-rose-200 bg-rose-50 p-3.5 text-xs text-rose-800">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
+            <p>{errorMessage}</p>
+          </div>
+          {audioPlaybackBlocked ? (
+            <button
+              type="button"
+              onClick={enableSpeakerAudio}
+              className="rounded-lg bg-rose-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-rose-800"
+            >
+              Enable Speaker Audio
+            </button>
+          ) : null}
         </div>
       ) : null}
 

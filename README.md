@@ -95,7 +95,7 @@ npm install
    - `GEMINI_API_KEY` — Google Gemini API key
    - `ELEVENLABS_API_KEY` — ElevenLabs API key (used for both STT & TTS)
    - `ELEVENLABS_VOICE_ID` — ElevenLabs voice ID for spoken assistant responses
-   - `GEMINI_MODEL` — Optional (default: `gemini-3.6-flash`)
+   - `GEMINI_MODEL` — Optional (default: `gemini-3.5-flash-lite`)
    - `VOICE_ICE_SERVERS` — Optional STUN/TURN URLs (default: `stun:stun.l.google.com:19302`)
 
 3. Set `NEXT_PUBLIC_API_URL=http://localhost:8000` in `D:\MediVoiceAI\frontend\.env.local`. Never place Gemini or ElevenLabs API keys in `NEXT_PUBLIC_*` variables.

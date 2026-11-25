@@ -43,7 +43,10 @@ class VoiceSessionRecord:
     error: str | None = None
 
     def record_and_emit_event(self, payload: dict) -> None:
-        """Persist transcript entries (deduplicated by ID) and forward over WebRTC DataChannel."""
+        """Persist transcript/error entries (deduplicated by ID) and forward over WebRTC DataChannel."""
+        if payload.get("type") == "error" and payload.get("message"):
+            self.error = payload["message"]
+
         if payload.get("type") == "transcript" and payload.get("id"):
             entry_id = payload["id"]
             existing_idx = next(
