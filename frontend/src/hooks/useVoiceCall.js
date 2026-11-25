@@ -165,6 +165,8 @@ export default function useVoiceCall({ remoteAudioRef, onAppointmentUpdated } = 
         }
       } else if (payload.type === "appointment_updated") {
         onAppointmentUpdatedRef.current?.(payload);
+      } else if (payload.type === "error" && payload.message) {
+        setErrorMessage(payload.message);
       }
     },
     [upsertTranscriptEntry],

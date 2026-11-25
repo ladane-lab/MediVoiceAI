@@ -124,6 +124,18 @@ export default function Home() {
     };
   }, []);
 
+  const handleManualAppointmentBooked = useCallback(
+    async (bookedPhone) => {
+      setAvailabilityRefreshTick((prev) => prev + 1);
+      const targetPhone = (bookedPhone || lookupPhone || "").trim();
+      if (targetPhone) {
+        setLookupPhone(targetPhone);
+        await loadAppointments(targetPhone);
+      }
+    },
+    [loadAppointments, lookupPhone],
+  );
+
   function handleLookupSubmit(phone) {
     const cleaned = phone.trim();
     setLookupPhone(cleaned);
@@ -217,6 +229,7 @@ export default function Home() {
                 onRefresh={loadDoctors}
                 availabilityRefreshTick={availabilityRefreshTick}
                 onStartVoiceCall={handleStartCallFromDoctor}
+                onAppointmentBooked={handleManualAppointmentBooked}
               />
 
               <AppointmentsSection
@@ -242,6 +255,7 @@ export default function Home() {
               onRefresh={loadDoctors}
               availabilityRefreshTick={availabilityRefreshTick}
               onStartVoiceCall={handleStartCallFromDoctor}
+              onAppointmentBooked={handleManualAppointmentBooked}
             />
           ) : null}
 

@@ -8,6 +8,7 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    ErrorFrame,
     Frame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -76,13 +77,14 @@ class UserTurnTranscriptObserver(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
             cleaned = frame.text.strip()
-            self._state.record_user_turn(cleaned)
+            self._seq += 1
+            turn_id = f"user-{self._seq}"
+            self._state.record_user_turn(cleaned, turn_id=turn_id)
             if self._on_event is not None:
-                self._seq += 1
                 self._on_event(
                     {
                         "type": "transcript",
-                        "id": f"user-{self._seq}",
+                        "id": turn_id,
                         "role": "user",
                         "text": cleaned,
                         "final": True,
@@ -151,6 +153,14 @@ class AssistantEventsObserver(FrameProcessor):
                 )
             self._current_turn_id = None
             self._buffer = ""
+
+        elif isinstance(frame, ErrorFrame):
+            self._emit(
+                {
+                    "type": "error",
+                    "message": "The voice assistant encountered a temporary service error. Please try again.",
+                }
+            )
 
         await self.push_frame(frame, direction)
 

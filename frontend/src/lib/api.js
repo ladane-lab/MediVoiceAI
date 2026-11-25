@@ -86,6 +86,27 @@ export function cancelAppointment(appointmentId, { patientPhoneNumber, phoneNumb
   });
 }
 
+export function bookAppointment({
+  doctorId,
+  patientName = "",
+  patientPhoneNumber,
+  appointmentDate,
+  appointmentTime,
+  phoneNumberConfirmed,
+}) {
+  return requestJson("/api/appointments/book", {
+    method: "POST",
+    body: JSON.stringify({
+      doctor_id: doctorId,
+      patient_name: patientName && patientName.trim() ? patientName.trim() : null,
+      patient_phone_number: patientPhoneNumber,
+      appointment_date: appointmentDate,
+      appointment_time: appointmentTime,
+      phone_number_confirmed: Boolean(phoneNumberConfirmed),
+    }),
+  });
+}
+
 export function createVoiceSession() {
   return requestJson("/api/voice/sessions", {
     method: "POST",

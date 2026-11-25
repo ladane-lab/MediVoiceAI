@@ -4,13 +4,14 @@ import { useEffect, useState } from "react";
 import {
   AlertCircle,
   Calendar,
+  CheckCircle2,
   Clock,
   GraduationCap,
   IndianRupee,
   RefreshCw,
   Stethoscope,
 } from "lucide-react";
-import { fetchDoctorAvailability } from "@/lib/api";
+import { bookAppointment, fetchDoctorAvailability } from "@/lib/api";
 
 function getTodayIso() {
   const now = new Date();
@@ -27,13 +28,22 @@ export default function DoctorsSection({
   onRefresh,
   availabilityRefreshTick = 0,
   onStartVoiceCall,
+  onAppointmentBooked,
 }) {
   const [selectedSpeciality, setSelectedSpeciality] = useState("All");
   const [selectedDoctor, setSelectedDoctor] = useState(null);
   const [selectedDate, setSelectedDate] = useState("");
+  const [selectedSlot, setSelectedSlot] = useState("");
   const [availability, setAvailability] = useState(null);
   const [availLoading, setAvailLoading] = useState(false);
   const [availError, setAvailError] = useState("");
+
+  const [patientName, setPatientName] = useState("");
+  const [patientPhone, setPatientPhone] = useState("");
+  const [phoneConfirmed, setPhoneConfirmed] = useState(false);
+  const [bookingBusy, setBookingBusy] = useState(false);
+  const [bookingError, setBookingError] = useState("");
+  const [bookingSuccess, setBookingSuccess] = useState(null);
 
   const specialities = [
     "All",
@@ -50,15 +60,64 @@ export default function DoctorsSection({
       setSelectedDate(getTodayIso());
     }
     setSelectedDoctor(doc);
+    setSelectedSlot("");
+    setBookingError("");
+    setBookingSuccess(null);
     setAvailLoading(true);
     setAvailError("");
   }
 
   function handleDateChange(nextDate) {
     setSelectedDate(nextDate);
+    setSelectedSlot("");
+    setBookingError("");
+    setBookingSuccess(null);
     if (selectedDoctor) {
       setAvailLoading(true);
       setAvailError("");
+    }
+  }
+
+  function handleSelectSlot(slot) {
+    setSelectedSlot(slot);
+    setBookingError("");
+    setBookingSuccess(null);
+  }
+
+  async function handleManualBooking(e) {
+    e.preventDefault();
+    if (!selectedDoctor || !selectedDate || !selectedSlot) return;
+
+    setBookingBusy(true);
+    setBookingError("");
+    setBookingSuccess(null);
+
+    try {
+      const result = await bookAppointment({
+        doctorId: selectedDoctor.id,
+        patientName,
+        patientPhoneNumber: patientPhone,
+        appointmentDate: selectedDate,
+        appointmentTime: selectedSlot,
+        phoneNumberConfirmed: phoneConfirmed,
+      });
+
+      const booked = result?.appointment;
+      setBookingSuccess(booked || { appointment_time: selectedSlot, appointment_date: selectedDate });
+      setSelectedSlot("");
+      setPhoneConfirmed(false);
+
+      // Refresh slot availability immediately for the selected doctor/date
+      const refreshed = await fetchDoctorAvailability(selectedDoctor.id, selectedDate);
+      setAvailability(refreshed);
+
+      if (onAppointmentBooked) {
+        await onAppointmentBooked(booked?.patient_phone_number || patientPhone);
+      }
+    } catch (err) {
+      setBookingError(err.message || "Unable to complete appointment booking.");
+    } finally {
+      setBookingBusy(false);
     }
   }
 
@@ -98,7 +157,7 @@ export default function DoctorsSection({
               Available Doctors
             </h2>
             <p className="text-xs text-slate-500">
-              Select a doctor to inspect real-time slot availability
+              Select a doctor, pick a date, and click an available slot to book
             </p>
           </div>
         </div>
@@ -210,7 +269,7 @@ export default function DoctorsSection({
         </div>
       )}
 
-      {/* Selected Doctor Live Availability Drawer */}
+      {/* Selected Doctor Live Availability & Manual Booking Drawer */}
       {selectedDoctor ? (
         <div className="mt-6 rounded-xl border border-teal-200 bg-teal-50/30 p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -254,14 +313,24 @@ export default function DoctorsSection({
             ) : availability ? (
               availability.available_slots.length > 0 ? (
                 <div className="flex flex-wrap gap-2">
-                  {availability.available_slots.map((slot) => (
-                    <span
-                      key={slot}
-                      className="rounded-lg border border-teal-200 bg-white px-3 py-1.5 font-mono text-xs font-medium text-[#0F2942]"
-                    >
-                      {slot}
-                    </span>
-                  ))}
+                  {availability.available_slots.map((slot) => {
+                    const isSlotSelected = selectedSlot === slot;
+                    return (
+                      <button
+                        key={slot}
+                        type="button"
+                        aria-pressed={isSlotSelected}
+                        onClick={() => handleSelectSlot(slot)}
+                        className={`cursor-pointer rounded-lg border px-3 py-1.5 font-mono text-xs font-medium transition-colors ${
+                          isSlotSelected
+                            ? "border-[#0F2942] bg-[#0F2942] text-white shadow-xs"
+                            : "border-teal-200 bg-white text-[#0F2942] hover:border-teal-500 hover:bg-teal-50"
+                        }`}
+                      >
+                        {slot}
+                      </button>
+                    );
+                  })}
                 </div>
               ) : (
                 <p className="text-xs text-slate-600">
@@ -270,6 +339,109 @@ export default function DoctorsSection({
               )
             ) : null}
           </div>
+
+          {bookingSuccess ? (
+            <div className="mt-4 flex items-start gap-2 rounded-xl border border-teal-200 bg-teal-50 px-4 py-3 text-xs text-teal-900">
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-teal-600" />
+              <div>
+                <p className="font-semibold">
+                  Appointment #{bookingSuccess.id} booked with {bookingSuccess.doctor_name || selectedDoctor.name}
+                </p>
+                <p className="mt-0.5 text-teal-800">
+                  {bookingSuccess.appointment_date} at {bookingSuccess.appointment_time} · Phone:{" "}
+                  {bookingSuccess.patient_phone_number}
+                </p>
+              </div>
+            </div>
+          ) : null}
+
+          {selectedSlot ? (
+            <form
+              onSubmit={handleManualBooking}
+              className="mt-4 rounded-xl border border-slate-200 bg-white p-4 shadow-xs"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wider text-teal-700">
+                    Selected Slot
+                  </p>
+                  <p className="text-sm font-semibold text-[#0F2942]">
+                    {selectedDoctor.name} · {selectedDate} at{" "}
+                    <span className="font-mono">{selectedSlot}</span>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedSlot("")}
+                  className="text-xs font-medium text-slate-500 hover:text-slate-700"
+                >
+                  Change slot
+                </button>
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700">
+                    Patient Name (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    value={patientName}
+                    onChange={(e) => setPatientName(e.target.value)}
+                    placeholder="e.g. Rahul"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-2 text-xs text-[#0F2942] outline-none focus:border-teal-500 focus:bg-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-700">
+                    Phone Number *
+                  </label>
+                  <input
+                    type="tel"
+                    required
+                    value={patientPhone}
+                    onChange={(e) => setPatientPhone(e.target.value)}
+                    placeholder="e.g. +919876543210 or 9876543210"
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-2 text-xs text-[#0F2942] outline-none focus:border-teal-500 focus:bg-white"
+                  />
+                </div>
+              </div>
+
+              <label className="mt-3 flex items-start gap-2 text-xs text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={phoneConfirmed}
+                  onChange={(e) => setPhoneConfirmed(e.target.checked)}
+                  className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                />
+                <span>
+                  I confirm that the phone number{" "}
+                  <span className="font-mono font-medium">
+                    {patientPhone.trim() || "entered above"}
+                  </span>{" "}
+                  is correct for this appointment.
+                </span>
+              </label>
+
+              {bookingError ? (
+                <div className="mt-3 flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-600" />
+                  <span>{bookingError}</span>
+                </div>
+              ) : null}
+
+              <div className="mt-3 flex justify-end">
+                <button
+                  type="submit"
+                  disabled={bookingBusy || !patientPhone.trim()}
+                  className="rounded-lg bg-teal-600 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-teal-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+                >
+                  {bookingBusy ? "Booking..." : "Confirm & Book Appointment"}
+                </button>
+              </div>
+            </form>
+          ) : null}
         </div>
       ) : null}
     </section>

@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import logging
 import re
 from typing import Any
 from sqlalchemy.orm import Session
@@ -23,8 +24,10 @@ from app.services.appointment_service import (
     normalize_phone_number,
 )
 
+logger = logging.getLogger(__name__)
+
 NEGATIVE_OR_HESITATION_PATTERN = re.compile(
-    r"\b(no|nope|nah|not|wrong|incorrect|mistake|change|repeat|wait|hold on|stop|don't|dont|do not|never mind|nevermind|instead)\b",
+    r"\b(no|nope|nah|not right|not correct|not that|not this|wrong|incorrect|mistake|change|repeat|wait|hold on|stop|don't|dont|do not|never mind|nevermind|instead)\b",
     re.IGNORECASE,
 )
 
@@ -73,14 +76,16 @@ class VoiceConversationState:
 
     pending_phone_number: str | None = None
     pending_phone_turn: int | None = None
+    pending_phone_affirmed_turn: int | None = None
     confirmed_phone_number: str | None = None
     phone_confirmed_turn: int | None = None
 
     pending_cancellation_id: int | None = None
     pending_cancellation_turn: int | None = None
+    pending_cancellation_affirmed_turn: int | None = None
     confirmed_cancellation_id: int | None = None
 
-    def record_user_turn(self, utterance: str) -> None:
+    def record_user_turn(self, utterance: str, turn_id: str | None = None) -> None:
         """Advance conversation turn when non-empty caller speech arrives."""
         cleaned = utterance.strip()
         if not cleaned:
@@ -90,31 +95,73 @@ class VoiceConversationState:
         self.last_user_utterance = cleaned
         self.last_user_turn_index = self.turn_index
 
+        rejected = bool(NEGATIVE_OR_HESITATION_PATTERN.search(cleaned))
+        affirmed = is_explicit_affirmative(cleaned)
+
+        # Check if the caller spoke a new phone number.
+        spoken_normalized: str | None = None
+        match = PHONE_CANDIDATE_PATTERN.search(cleaned)
+        if match:
+            try:
+                spoken_normalized = normalize_phone_number(match.group(0))
+            except AppointmentServiceError:
+                spoken_normalized = None
+
+        # Changing the phone number invalidates prior phone and cancellation confirmations.
+        if spoken_normalized:
+            if self.confirmed_phone_number and spoken_normalized != self.confirmed_phone_number:
+                self.confirmed_phone_number = None
+                self.phone_confirmed_turn = None
+                self.pending_phone_number = None
+                self.pending_phone_turn = None
+                self.pending_phone_affirmed_turn = None
+                self.pending_cancellation_id = None
+                self.pending_cancellation_turn = None
+                self.pending_cancellation_affirmed_turn = None
+                self.confirmed_cancellation_id = None
+            elif self.pending_phone_number and spoken_normalized != self.pending_phone_number:
+                self.pending_phone_number = None
+                self.pending_phone_turn = None
+                self.pending_phone_affirmed_turn = None
+
         # If caller explicitly rejects or hesitates, clear active pending gates.
-        if NEGATIVE_OR_HESITATION_PATTERN.search(cleaned):
+        if rejected:
             if self.pending_phone_number and not self.confirmed_phone_number:
                 self.pending_phone_number = None
                 self.pending_phone_turn = None
+                self.pending_phone_affirmed_turn = None
             if self.pending_cancellation_id and not self.confirmed_cancellation_id:
                 self.pending_cancellation_id = None
                 self.pending_cancellation_turn = None
+                self.pending_cancellation_affirmed_turn = None
+        elif affirmed:
+            # Capture explicit affirmative immediately while a readback is awaiting confirmation
+            # so a subsequent unrelated follow-up question does not erase the affirmative.
+            if (
+                self.pending_phone_number is not None
+                and self.pending_phone_turn is not None
+                and self.turn_index > self.pending_phone_turn
+                and self.confirmed_phone_number != self.pending_phone_number
+            ):
+                self.pending_phone_affirmed_turn = self.turn_index
 
-        # If caller speaks a different phone number, invalidate prior confirmations.
-        if self.confirmed_phone_number:
-            match = PHONE_CANDIDATE_PATTERN.search(cleaned)
-            if match:
-                try:
-                    spoken_normalized = normalize_phone_number(match.group(0))
-                except AppointmentServiceError:
-                    spoken_normalized = None
-                if spoken_normalized and spoken_normalized != self.confirmed_phone_number:
-                    self.confirmed_phone_number = None
-                    self.phone_confirmed_turn = None
-                    self.pending_phone_number = None
-                    self.pending_phone_turn = None
-                    self.pending_cancellation_id = None
-                    self.pending_cancellation_turn = None
-                    self.confirmed_cancellation_id = None
+            if (
+                self.pending_cancellation_id is not None
+                and self.pending_cancellation_turn is not None
+                and self.turn_index > self.pending_cancellation_turn
+                and self.confirmed_cancellation_id != self.pending_cancellation_id
+            ):
+                self.pending_cancellation_affirmed_turn = self.turn_index
+
+        logger.info(
+            "Voice turn recorded: turn_id=%s turn_index=%d pending_phone=%s confirmed_phone=%s affirmed=%s rejected=%s",
+            turn_id or "n/a",
+            self.turn_index,
+            bool(self.pending_phone_number),
+            bool(self.confirmed_phone_number),
+            affirmed,
+            rejected,
+        )
 
     def is_phone_confirmed(self, normalized_phone: str) -> bool:
         """Return True only when the exact normalized phone number is confirmed."""
@@ -142,16 +189,37 @@ class VoiceConversationState:
                 "message": "Phone number is already confirmed.",
             }
 
+        # Preserve existing staged readback if caller already has this exact number pending
+        # and we are waiting on or have already captured their post-readback affirmative.
+        if (
+            self.pending_phone_number == normalized
+            and self.pending_phone_turn is not None
+            and self.pending_phone_affirmed_turn is not None
+            and self.pending_phone_affirmed_turn > self.pending_phone_turn
+        ):
+            self.confirmed_phone_number = normalized
+            self.phone_confirmed_turn = self.pending_phone_affirmed_turn
+            return {
+                "success": True,
+                "confirmed": True,
+                "phone_number": normalized,
+                "digit_by_digit": format_phone_digit_by_digit(normalized),
+                "message": "Phone number confirmed by caller.",
+            }
+
         self.pending_phone_number = normalized
         self.pending_phone_turn = self.turn_index
+        self.pending_phone_affirmed_turn = None
         self.confirmed_phone_number = None
         self.phone_confirmed_turn = None
         # Changing caller phone invalidates any prior cancellation approval.
         self.pending_cancellation_id = None
         self.pending_cancellation_turn = None
+        self.pending_cancellation_affirmed_turn = None
         self.confirmed_cancellation_id = None
 
         spoken_digits = format_phone_digit_by_digit(normalized)
+        logger.info("Staged phone number for confirmation at turn_index=%d", self.turn_index)
         return {
             "success": True,
             "confirmed": False,
@@ -169,6 +237,17 @@ class VoiceConversationState:
         affirmative caller transcript after digit-by-digit readback.
         """
         normalized = normalize_phone_number(raw_phone)
+
+        if self.is_phone_confirmed(normalized):
+            return {
+                "success": True,
+                "confirmed": True,
+                "phone_number": normalized,
+                "message": (
+                    "Phone number confirmed. If doctor, date, and time are already selected, "
+                    "call book_appointment now."
+                ),
+            }
 
         if not caller_confirmed:
             staged = self.stage_phone_number(normalized)
@@ -196,18 +275,19 @@ class VoiceConversationState:
                 ),
             }
 
-        if NEGATIVE_OR_HESITATION_PATTERN.search(self.last_user_utterance):
-            self.pending_phone_number = None
-            self.pending_phone_turn = None
-            self.confirmed_phone_number = None
-            self.phone_confirmed_turn = None
-            return {
-                "success": False,
-                "confirmed": False,
-                "message": "Caller indicated the phone number was incorrect. Ask them to repeat it.",
-            }
+        if self.pending_phone_affirmed_turn is None or self.pending_phone_affirmed_turn <= self.pending_phone_turn:
+            if NEGATIVE_OR_HESITATION_PATTERN.search(self.last_user_utterance):
+                self.pending_phone_number = None
+                self.pending_phone_turn = None
+                self.pending_phone_affirmed_turn = None
+                self.confirmed_phone_number = None
+                self.phone_confirmed_turn = None
+                return {
+                    "success": False,
+                    "confirmed": False,
+                    "message": "Caller indicated the phone number was incorrect. Ask them to repeat it.",
+                }
 
-        if not is_explicit_affirmative(self.last_user_utterance):
             spoken_digits = format_phone_digit_by_digit(normalized)
             return {
                 "success": False,
@@ -221,18 +301,50 @@ class VoiceConversationState:
             }
 
         self.confirmed_phone_number = normalized
-        self.phone_confirmed_turn = self.last_user_turn_index
+        self.phone_confirmed_turn = self.pending_phone_affirmed_turn
+        logger.info(
+            "Phone confirmation succeeded at turn_index=%d (affirmed_turn=%d)",
+            self.turn_index,
+            self.phone_confirmed_turn,
+        )
         return {
             "success": True,
             "confirmed": True,
             "phone_number": normalized,
-            "message": "Phone number confirmed.",
+            "message": (
+                "Phone number confirmed. If doctor, date, and time are already selected, "
+                "call book_appointment now."
+            ),
         }
+
+    def try_resolve_pending_phone_confirmation(self, normalized_phone: str) -> bool:
+        """
+        Promote a staged phone number to confirmed if the caller has already
+        spoken an explicit affirmative after readback.
+        """
+        if self.is_phone_confirmed(normalized_phone):
+            return True
+        if (
+            self.pending_phone_number == normalized_phone
+            and self.pending_phone_turn is not None
+            and self.pending_phone_affirmed_turn is not None
+            and self.pending_phone_affirmed_turn > self.pending_phone_turn
+        ):
+            self.confirmed_phone_number = normalized_phone
+            self.phone_confirmed_turn = self.pending_phone_affirmed_turn
+            logger.info(
+                "Auto-promoted affirmed phone confirmation at turn_index=%d (affirmed_turn=%d)",
+                self.turn_index,
+                self.phone_confirmed_turn,
+            )
+            return True
+        return False
 
     def stage_cancellation(self, appointment_id: int, appointment_summary: dict[str, Any]) -> dict[str, Any]:
         """Stage an appointment for explicit caller cancellation confirmation."""
         self.pending_cancellation_id = appointment_id
         self.pending_cancellation_turn = self.turn_index
+        self.pending_cancellation_affirmed_turn = None
         self.confirmed_cancellation_id = None
         return {
             "success": False,
@@ -280,17 +392,20 @@ class VoiceConversationState:
                 ),
             }
 
-        if NEGATIVE_OR_HESITATION_PATTERN.search(self.last_user_utterance):
-            self.pending_cancellation_id = None
-            self.pending_cancellation_turn = None
-            self.confirmed_cancellation_id = None
-            return {
-                "success": False,
-                "cancellation_confirmed": False,
-                "message": "Caller declined cancellation. Keep the appointment booked.",
-            }
-
-        if not is_explicit_affirmative(self.last_user_utterance):
+        if (
+            self.pending_cancellation_affirmed_turn is None
+            or self.pending_cancellation_affirmed_turn <= self.pending_cancellation_turn
+        ):
+            if NEGATIVE_OR_HESITATION_PATTERN.search(self.last_user_utterance):
+                self.pending_cancellation_id = None
+                self.pending_cancellation_turn = None
+                self.pending_cancellation_affirmed_turn = None
+                self.confirmed_cancellation_id = None
+                return {
+                    "success": False,
+                    "cancellation_confirmed": False,
+                    "message": "Caller declined cancellation. Keep the appointment booked.",
+                }
             return {
                 "success": False,
                 "cancellation_confirmed": False,
@@ -374,9 +489,22 @@ def tool_confirm_phone_number(
     caller_confirmed: bool = False,
 ) -> dict[str, Any]:
     """Enforce digit-by-digit phone confirmation before booking, listing, or cancelling."""
+    logger.info(
+        "confirm_phone_number invoked: caller_confirmed=%s turn_index=%d pending=%s",
+        bool(caller_confirmed),
+        state.turn_index,
+        bool(state.pending_phone_number),
+    )
     try:
-        return state.confirm_phone(raw_phone=phone_number, caller_confirmed=bool(caller_confirmed))
+        result = state.confirm_phone(raw_phone=phone_number, caller_confirmed=bool(caller_confirmed))
+        logger.info(
+            "confirm_phone_number result: success=%s confirmed=%s",
+            result.get("success"),
+            result.get("confirmed"),
+        )
+        return result
     except AppointmentServiceError as exc:
+        logger.warning("confirm_phone_number error: error_code=%s", exc.error_code)
         return _safe_error(exc.message, exc.error_code)
 
 
@@ -390,12 +518,36 @@ def tool_book_appointment(
     db: Session | None = None,
 ) -> dict[str, Any]:
     """Book an appointment only if the caller's phone number is confirmed in state."""
+    logger.info(
+        "book_appointment invoked: doctor_id=%s date=%s time=%s turn_index=%d confirmed_phone=%s",
+        doctor_id,
+        appointment_date,
+        appointment_time,
+        state.turn_index,
+        bool(state.confirmed_phone_number),
+    )
     try:
         normalized_phone = normalize_phone_number(patient_phone_number)
     except AppointmentServiceError as exc:
+        logger.warning("book_appointment invalid phone: error_code=%s", exc.error_code)
         return _safe_error(exc.message, exc.error_code)
 
-    if not state.is_phone_confirmed(normalized_phone):
+    if not state.try_resolve_pending_phone_confirmation(normalized_phone):
+        # Do not clobber an active pending readback for the same phone number on the same turn.
+        if state.pending_phone_number == normalized_phone and state.pending_phone_turn is not None:
+            spoken_digits = format_phone_digit_by_digit(normalized_phone)
+            return {
+                "success": False,
+                "requires_phone_confirmation": True,
+                "phone_number": normalized_phone,
+                "digit_by_digit": spoken_digits,
+                "error": (
+                    f"Phone number is not confirmed yet. Repeat {spoken_digits} "
+                    "digit by digit, ask the caller to confirm, and wait for yes."
+                ),
+                "error_code": "phone_not_confirmed",
+            }
+
         staged = state.stage_phone_number(normalized_phone)
         return {
             "success": False,
@@ -411,7 +563,7 @@ def tool_book_appointment(
         }
 
     try:
-        return service_book_appointment(
+        result = service_book_appointment(
             doctor_id=int(doctor_id),
             patient_phone_number=normalized_phone,
             appointment_date=appointment_date,
@@ -420,9 +572,27 @@ def tool_book_appointment(
             phone_number_confirmed=True,
             db=db,
         )
+        appt = result.get("appointment") or {}
+        logger.info(
+            "book_appointment persisted: appointment_id=%s doctor_id=%s date=%s time=%s status=%s",
+            appt.get("id"),
+            appt.get("doctor_id"),
+            appt.get("appointment_date"),
+            appt.get("appointment_time"),
+            appt.get("status"),
+        )
+        return result
     except AppointmentServiceError as exc:
+        logger.warning(
+            "book_appointment service rejected: doctor_id=%s date=%s time=%s error_code=%s",
+            doctor_id,
+            appointment_date,
+            appointment_time,
+            exc.error_code,
+        )
         return _safe_error(exc.message, exc.error_code)
     except (TypeError, ValueError):
+        logger.warning("book_appointment invalid arguments")
         return _safe_error("Invalid booking arguments provided.", "invalid_arguments")
 
 
@@ -437,7 +607,20 @@ def tool_list_appointments(
     except AppointmentServiceError as exc:
         return _safe_error(exc.message, exc.error_code)
 
-    if not state.is_phone_confirmed(normalized_phone):
+    if not state.try_resolve_pending_phone_confirmation(normalized_phone):
+        if state.pending_phone_number == normalized_phone and state.pending_phone_turn is not None:
+            spoken_digits = format_phone_digit_by_digit(normalized_phone)
+            return {
+                "success": False,
+                "requires_phone_confirmation": True,
+                "phone_number": normalized_phone,
+                "digit_by_digit": spoken_digits,
+                "error": (
+                    f"Phone number must be confirmed before looking up appointments. Repeat "
+                    f"{spoken_digits} digit by digit and ask the caller to confirm."
+                ),
+                "error_code": "phone_not_confirmed",
+            }
         staged = state.stage_phone_number(normalized_phone)
         return {
             "success": False,
@@ -619,6 +802,11 @@ def build_voice_tools(
             phone_number=args.get("phone_number", ""),
             caller_confirmed=bool(args.get("caller_confirmed", False)),
         )
+        logger.info(
+            "Returning confirm_phone_number result to Gemini: success=%s confirmed=%s",
+            result.get("success"),
+            result.get("confirmed"),
+        )
         await params.result_callback(result)
 
     async def handle_book_appointment(params: FunctionCallParams):
@@ -632,6 +820,11 @@ def build_voice_tools(
             appointment_date=args.get("appointment_date", ""),
             appointment_time=args.get("appointment_time", ""),
             patient_name=args.get("patient_name"),
+        )
+        logger.info(
+            "Returning book_appointment result to Gemini: success=%s error_code=%s",
+            result.get("success"),
+            result.get("error_code"),
         )
         if result.get("success"):
             _emit(

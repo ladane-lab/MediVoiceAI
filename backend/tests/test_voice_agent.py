@@ -523,3 +523,117 @@ def test_transcript_observers_emit_and_deduplicate_events():
     assert record.transcript[1]["final"] is True
     assert mock_conn.send_app_message.call_count >= 3
 
+
+def test_transcript_repro_yes_followed_by_unrelated_speech_still_books(isolated_db):
+    """
+    Regression test reproducing the real transcript:
+    9022301782 -> No -> corrected to 9022301782 -> 'Yes, it is correct.'
+    followed by unrelated speech ('Is my appointment booked or not?').
+    Booking must succeed when caller affirmed after readback.
+    """
+    db, _ = isolated_db
+    state = VoiceConversationState()
+    monday = next_weekday(0).isoformat()
+
+    # Step 7-9: First number rejected with "No"
+    state.record_user_turn("9022301782", turn_id="user-1")
+    tool_confirm_phone_number(state, "9022301782", caller_confirmed=False)
+    state.record_user_turn("No", turn_id="user-2")
+    rejected = tool_book_appointment(
+        state=state,
+        doctor_id=1,
+        patient_phone_number="9022301782",
+        appointment_date=monday,
+        appointment_time="10:00",
+        db=db,
+    )
+    assert rejected["success"] is False
+
+    # Step 11-12: Caller corrects number, assistant stages readback
+    state.record_user_turn("9123456789, wait 9022301782", turn_id="user-3")
+    staged = tool_confirm_phone_number(state, "9022301782", caller_confirmed=False)
+    assert staged["confirmed"] is False
+
+    # Step 13: Caller says "Yes, it is correct."
+    state.record_user_turn("Yes, it is correct.", turn_id="user-4")
+
+    # Step 14: Subsequent unrelated utterance arrives before tool executes
+    state.record_user_turn("Who has your appointment schedule? Is my appointment booked or not?", turn_id="user-5")
+
+    # Even if Gemini calls confirm_phone_number or book_appointment directly after unrelated speech,
+    # the captured explicit affirmative from turn-4 remains valid!
+    confirmed = tool_confirm_phone_number(state, "+919022301782", caller_confirmed=True)
+    assert confirmed["confirmed"] is True
+
+    booked = tool_book_appointment(
+        state=state,
+        doctor_id=1,
+        patient_phone_number="+919022301782",
+        appointment_date=monday,
+        appointment_time="10:00",
+        db=db,
+    )
+    assert booked["success"] is True
+    assert booked["appointment"]["status"] == "booked"
+
+    # Lookup immediately reflects the persisted DB booking
+    listed = tool_list_appointments(state=state, patient_phone_number="+919022301782", db=db)
+    assert listed["success"] is True
+    assert listed["total"] == 1
+
+
+def test_direct_book_appointment_after_explicit_affirmative(isolated_db):
+    """If Gemini skips confirm_phone_number(true) and calls book_appointment after 'Yes', it succeeds."""
+    db, _ = isolated_db
+    state = VoiceConversationState()
+    monday = next_weekday(0).isoformat()
+
+    state.record_user_turn("9022301782", turn_id="user-1")
+    tool_confirm_phone_number(state, "9022301782", caller_confirmed=False)
+    state.record_user_turn("Yes, it is correct.", turn_id="user-2")
+
+    booked = tool_book_appointment(
+        state=state,
+        doctor_id=1,
+        patient_phone_number="+919022301782",
+        appointment_date=monday,
+        appointment_time="10:20",
+        db=db,
+    )
+    assert booked["success"] is True
+    assert booked["appointment"]["appointment_time"] == "10:20"
+
+
+def test_booking_failure_communicated_truthfully(isolated_db):
+    """Unavailable slot or duplicate booking returns success=False with a readable error."""
+    db, _ = isolated_db
+    state = VoiceConversationState()
+    monday = next_weekday(0).isoformat()
+
+    state.record_user_turn("9022301782", turn_id="user-1")
+    tool_confirm_phone_number(state, "9022301782", caller_confirmed=False)
+    state.record_user_turn("Yes", turn_id="user-2")
+
+    first = tool_book_appointment(
+        state=state,
+        doctor_id=1,
+        patient_phone_number="+919022301782",
+        appointment_date=monday,
+        appointment_time="10:40",
+        db=db,
+    )
+    assert first["success"] is True
+
+    duplicate = tool_book_appointment(
+        state=state,
+        doctor_id=1,
+        patient_phone_number="+919022301782",
+        appointment_date=monday,
+        appointment_time="10:40",
+        db=db,
+    )
+    assert duplicate["success"] is False
+    assert duplicate["error_code"] == "duplicate_booking"
+    assert "already booked" in duplicate["error"].lower()
+
+
