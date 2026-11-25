@@ -26,13 +26,20 @@ class Settings(BaseSettings):
 
     # AI and voice provider keys (configured for Phase 2+)
     gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
+    voice_ice_servers: str = "stun:stun.l.google.com:19302"
 
     @property
     def cors_origins_list(self) -> list[str]:
         """Parse comma-separated CORS origins into a clean list."""
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def ice_servers_list(self) -> list[str]:
+        """Parse comma-separated STUN/TURN URLs for WebRTC."""
+        return [url.strip() for url in self.voice_ice_servers.split(",") if url.strip()]
 
     @staticmethod
     def is_secret_configured(value: str) -> bool:
@@ -41,6 +48,15 @@ class Settings(BaseSettings):
         if not cleaned:
             return False
         return not cleaned.lower().startswith(PLACEHOLDER_PREFIXES)
+
+    def missing_voice_env_vars(self) -> list[str]:
+        """Return names of missing or placeholder voice credentials."""
+        required = {
+            "GEMINI_API_KEY": self.gemini_api_key,
+            "ELEVENLABS_API_KEY": self.elevenlabs_api_key,
+            "ELEVENLABS_VOICE_ID": self.elevenlabs_voice_id,
+        }
+        return [name for name, val in required.items() if not self.is_secret_configured(val)]
 
 
 @lru_cache

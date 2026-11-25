@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.routes.appointments import router as appointments_router
 from app.routes.doctors import router as doctors_router
+from app.routes.voice import get_voice_session_manager, router as voice_router
 from app.seed import init_db
 
 settings = get_settings()
@@ -15,15 +16,16 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Initialize SQLite tables and seed mock doctors on application startup."""
+    """Initialize SQLite tables on startup and shut down voice sessions on exit."""
     init_db()
     yield
+    await get_voice_session_manager().shutdown_all()
 
 
 app = FastAPI(
     title="MediVoice AI Backend",
     description="Voice-Based Doctor Appointment Assistant API",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -37,6 +39,7 @@ app.add_middleware(
 
 app.include_router(doctors_router)
 app.include_router(appointments_router)
+app.include_router(voice_router)
 
 
 @app.get("/")

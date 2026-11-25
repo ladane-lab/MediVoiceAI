@@ -141,3 +141,82 @@ class AppointmentCancelResponse(BaseModel):
     message: str
     appointment_id: int
     status: Literal["cancelled"]
+
+
+class VoiceStatusResponse(BaseModel):
+    """Non-secret readiness report for the Pipecat WebRTC voice agent."""
+
+    ready: bool
+    transport: str
+    llm_provider: str
+    llm_model: str
+    stt_provider: str
+    tts_provider: str
+    missing_env_vars: list[str]
+    active_sessions: int
+
+
+class VoiceSessionCreateResponse(BaseModel):
+    """Response returned when pre-registering a voice session."""
+
+    session_id: str
+    status: str
+    transport: str
+    offer_url: str
+    ice_servers: list[str]
+
+
+class VoiceOfferRequest(BaseModel):
+    """WebRTC SDP offer payload from the browser."""
+
+    sdp: str = Field(..., min_length=1)
+    type: Literal["offer", "answer", "pranswer", "rollback"] = "offer"
+    pc_id: str | None = None
+    restart_pc: bool | None = None
+    session_id: str | None = None
+
+
+class VoiceOfferResponse(BaseModel):
+    """WebRTC SDP answer returned to complete browser peer connection."""
+
+    sdp: str
+    type: str
+    pc_id: str
+    session_id: str
+
+
+class IceCandidatePayload(BaseModel):
+    """Single WebRTC ICE candidate."""
+
+    candidate: str
+    sdp_mid: str | None = None
+    sdp_mline_index: int | None = None
+
+
+class VoiceIcePatchRequest(BaseModel):
+    """Trickle ICE candidate update request."""
+
+    pc_id: str = Field(..., min_length=1)
+    candidates: list[IceCandidatePayload]
+
+
+class VoiceSessionStateSummary(BaseModel):
+    """Sanitized confirmation state summary for a voice session."""
+
+    session_id: str
+    pc_id: str | None = None
+    status: str
+    created_at: datetime
+    phone_confirmed: bool
+    pending_phone_confirmation: bool
+    pending_cancellation_id: int | None = None
+    error: str | None = None
+
+
+class VoiceSessionEndResponse(BaseModel):
+    """Response returned when ending a voice session."""
+
+    success: bool
+    session_id: str
+    status: str
+    message: str
