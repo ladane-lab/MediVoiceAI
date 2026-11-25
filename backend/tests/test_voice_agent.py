@@ -2,7 +2,15 @@
 
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
+import asyncio
 from fastapi.testclient import TestClient
+from pipecat.frames.frames import (
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
+    TranscriptionFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -12,9 +20,15 @@ from app.database import Base
 from app.main import app
 from app.routes.voice import get_voice_session_manager
 from app.seed import seed_doctors
-from app.voice.agent import VoiceConfigurationError, build_voice_pipeline, validate_voice_configuration
+from app.voice.agent import (
+    AssistantEventsObserver,
+    UserTurnTranscriptObserver,
+    VoiceConfigurationError,
+    build_voice_pipeline,
+    validate_voice_configuration,
+)
 from app.voice.prompts import build_system_prompt
-from app.voice.session import VoiceSessionManager
+from app.voice.session import VoiceSessionManager, VoiceSessionRecord
 from app.voice.tools import (
     VoiceConversationState,
     build_voice_tools,
@@ -382,3 +396,130 @@ def test_mocked_pipecat_pipeline_and_tools_schema(isolated_db):
         mock_transport.assert_called_once()
         mock_pipeline.assert_called_once()
         mock_task.assert_called_once()
+
+
+def test_phone_confirmation_rejects_unrelated_silence_and_number_change(isolated_db):
+    """Section 8: Unrelated speech, silence, negative replies, and number changes must not confirm."""
+    db, _ = isolated_db
+    state = VoiceConversationState()
+    monday = next_weekday(0).isoformat()
+
+    # Stage phone number
+    state.record_user_turn("My number is +919876543210")
+    tool_confirm_phone_number(state, "+919876543210", caller_confirmed=False)
+
+    # Silence (empty transcript) must NOT confirm even if Gemini passes caller_confirmed=True
+    state.record_user_turn("   ")
+    res_silence = tool_confirm_phone_number(state, "+919876543210", caller_confirmed=True)
+    assert res_silence["confirmed"] is False
+
+    # Unrelated speech must NOT confirm even if Gemini passes caller_confirmed=True
+    state.record_user_turn("What time is Dr. Sharma free tomorrow?")
+    res_unrelated = tool_confirm_phone_number(state, "+919876543210", caller_confirmed=True)
+    assert res_unrelated["confirmed"] is False
+
+    # Mixed negative/hesitation speech must NOT confirm
+    state.record_user_turn("Yes, wait, the last digit is wrong")
+    res_mixed = tool_confirm_phone_number(state, "+919876543210", caller_confirmed=True)
+    assert res_mixed["confirmed"] is False
+
+    # Re-stage and confirm explicitly with "That's right"
+    state.record_user_turn("9876543210")
+    tool_confirm_phone_number(state, "+919876543210", caller_confirmed=False)
+    state.record_user_turn("Yes, that's right")
+    res_ok = tool_confirm_phone_number(state, "+919876543210", caller_confirmed=True)
+    assert res_ok["confirmed"] is True
+
+    # Speaking a different phone number must invalidate the previous confirmation
+    state.record_user_turn("Actually use 9123456789")
+    assert state.is_phone_confirmed("+919876543210") is False
+    blocked = tool_book_appointment(
+        state=state,
+        doctor_id=1,
+        patient_phone_number="+919876543210",
+        appointment_date=monday,
+        appointment_time="10:00",
+        db=db,
+    )
+    assert blocked["success"] is False
+    assert blocked["requires_phone_confirmation"] is True
+
+
+def test_cancellation_confirmation_rejects_unrelated_and_negative_speech(isolated_db):
+    """Section 8: Cancellation must reject unrelated speech, silence, and negative replies."""
+    db, _ = isolated_db
+    state = VoiceConversationState()
+    monday = next_weekday(0).isoformat()
+
+    state.record_user_turn("+919876543210")
+    tool_confirm_phone_number(state, "+919876543210", False)
+    state.record_user_turn("Correct")
+    tool_confirm_phone_number(state, "+919876543210", True)
+
+    booked = tool_book_appointment(
+        state=state,
+        doctor_id=1,
+        patient_phone_number="+919876543210",
+        appointment_date=monday,
+        appointment_time="11:00",
+        db=db,
+    )
+    appt_id = booked["appointment"]["id"]
+
+    # Stage cancellation (reads appointment details back)
+    staged = tool_confirm_cancellation(state, appt_id, "+919876543210", caller_confirmed=False, db=db)
+    assert staged["requires_cancellation_confirmation"] is True
+
+    # Silence does not confirm
+    state.record_user_turn("")
+    res_silence = tool_confirm_cancellation(state, appt_id, "+919876543210", caller_confirmed=True, db=db)
+    assert res_silence["cancellation_confirmed"] is False
+
+    # Unrelated question does not confirm
+    state.record_user_turn("By the way, what is the consultation fee?")
+    res_unrelated = tool_confirm_cancellation(state, appt_id, "+919876543210", caller_confirmed=True, db=db)
+    assert res_unrelated["cancellation_confirmed"] is False
+
+    # Negative response resets pending cancellation
+    state.record_user_turn("No, keep my appointment")
+    res_reject = tool_confirm_cancellation(state, appt_id, "+919876543210", caller_confirmed=True, db=db)
+    assert res_reject["cancellation_confirmed"] is False
+    assert state.pending_cancellation_id is None
+
+    # Re-stage and confirm explicitly
+    tool_confirm_cancellation(state, appt_id, "+919876543210", caller_confirmed=False, db=db)
+    state.record_user_turn("Yes, confirm cancellation")
+    res_approved = tool_confirm_cancellation(state, appt_id, "+919876543210", caller_confirmed=True, db=db)
+    assert res_approved["cancellation_confirmed"] is True
+
+
+def test_transcript_observers_emit_and_deduplicate_events():
+    """Verify UserTurnTranscriptObserver and AssistantEventsObserver record and emit transcripts."""
+    mock_conn = MagicMock()
+    record = VoiceSessionRecord(session_id="sess-1", connection=mock_conn)
+
+    user_obs = UserTurnTranscriptObserver(record.state, on_event=record.record_and_emit_event)
+    assistant_obs = AssistantEventsObserver(on_event=record.record_and_emit_event)
+    user_obs.push_frame = MagicMock(side_effect=lambda f, d: asyncio.sleep(0))
+    assistant_obs.push_frame = MagicMock(side_effect=lambda f, d: asyncio.sleep(0))
+
+    async def _run():
+        await user_obs.process_frame(
+            TranscriptionFrame(text="Hello MediVoice", user_id="caller", timestamp="2026-11-25T10:00:00Z"),
+            FrameDirection.DOWNSTREAM,
+        )
+        await assistant_obs.process_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
+        await assistant_obs.process_frame(LLMTextFrame(text="Hello! "), FrameDirection.DOWNSTREAM)
+        await assistant_obs.process_frame(LLMTextFrame(text="How can I help?"), FrameDirection.DOWNSTREAM)
+        await assistant_obs.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
+
+    asyncio.run(_run())
+
+    assert len(record.transcript) == 2
+    assert record.transcript[0]["role"] == "user"
+    assert record.transcript[0]["text"] == "Hello MediVoice"
+    assert record.transcript[1]["role"] == "assistant"
+    assert record.transcript[1]["text"] == "Hello! How can I help?"
+    assert record.transcript[1]["final"] is True
+    assert mock_conn.send_app_message.call_count >= 3
+

@@ -1,8 +1,21 @@
 """Pipecat voice pipeline assembly using SmallWebRTC, ElevenLabs, Silero VAD, and Google Gemini."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import Frame, TranscriptionFrame
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    Frame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
+    TranscriptionFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -42,16 +55,120 @@ def validate_voice_configuration(settings: Settings) -> None:
 
 
 class UserTurnTranscriptObserver(FrameProcessor):
-    """Observes final STT transcripts so conversation confirmation gates track real user turns."""
+    """
+    Observes finalized ElevenLabs STT TranscriptionFrames.
 
-    def __init__(self, state: VoiceConversationState):
+    Advances VoiceConversationState for caller confirmation checks and emits
+    caller transcript events to the browser over WebRTC DataChannel.
+    """
+
+    def __init__(
+        self,
+        state: VoiceConversationState,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ):
         super().__init__()
         self._state = state
+        self._on_event = on_event
+        self._seq = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
-            self._state.record_user_turn(frame.text)
+            cleaned = frame.text.strip()
+            self._state.record_user_turn(cleaned)
+            if self._on_event is not None:
+                self._seq += 1
+                self._on_event(
+                    {
+                        "type": "transcript",
+                        "id": f"user-{self._seq}",
+                        "role": "user",
+                        "text": cleaned,
+                        "final": True,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    }
+                )
+        await self.push_frame(frame, direction)
+
+
+class AssistantEventsObserver(FrameProcessor):
+    """
+    Captures Gemini response text frames and user VAD speaking state
+    to emit live assistant transcripts and speaking indicators.
+    """
+
+    def __init__(self, on_event: Callable[[dict[str, Any]], None] | None = None):
+        super().__init__()
+        self._on_event = on_event
+        self._turn_seq = 0
+        self._current_turn_id: str | None = None
+        self._buffer: str = ""
+
+    def _emit(self, payload: dict[str, Any]) -> None:
+        if self._on_event is not None:
+            self._on_event(payload)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, UserStartedSpeakingFrame):
+            self._emit({"type": "activity", "speaker": "user", "speaking": True})
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            self._emit({"type": "activity", "speaker": "user", "speaking": False})
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            self._turn_seq += 1
+            self._current_turn_id = f"assistant-{self._turn_seq}"
+            self._buffer = ""
+        elif isinstance(frame, LLMTextFrame):
+            if self._current_turn_id is None:
+                self._turn_seq += 1
+                self._current_turn_id = f"assistant-{self._turn_seq}"
+                self._buffer = ""
+            self._buffer += frame.text
+            if self._buffer.strip():
+                self._emit(
+                    {
+                        "type": "transcript",
+                        "id": self._current_turn_id,
+                        "role": "assistant",
+                        "text": self._buffer.strip(),
+                        "final": False,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    }
+                )
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            if self._current_turn_id and self._buffer.strip():
+                self._emit(
+                    {
+                        "type": "transcript",
+                        "id": self._current_turn_id,
+                        "role": "assistant",
+                        "text": self._buffer.strip(),
+                        "final": True,
+                        "timestamp": datetime.now(UTC).isoformat(),
+                    }
+                )
+            self._current_turn_id = None
+            self._buffer = ""
+
+        await self.push_frame(frame, direction)
+
+
+class BotSpeakingObserver(FrameProcessor):
+    """Tracks actual WebRTC audio output speaking state for the assistant."""
+
+    def __init__(self, on_event: Callable[[dict[str, Any]], None] | None = None):
+        super().__init__()
+        self._on_event = on_event
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if self._on_event is not None:
+            if isinstance(frame, BotStartedSpeakingFrame):
+                self._on_event({"type": "activity", "speaker": "assistant", "speaking": True})
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                self._on_event({"type": "activity", "speaker": "assistant", "speaking": False})
         await self.push_frame(frame, direction)
 
 
@@ -70,19 +187,21 @@ def build_voice_pipeline(
     webrtc_connection: SmallWebRTCConnection,
     settings: Settings,
     state: VoiceConversationState | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> VoicePipelineBundle:
     """
     Construct a real-time Pipecat audio pipeline for a browser WebRTC connection.
 
     Pipeline flow:
-    Browser Audio -> SmallWebRTC Input -> ElevenLabs Realtime STT -> Transcript Observer
+    Browser Audio -> SmallWebRTC Input -> ElevenLabs Realtime STT -> UserTranscriptObserver
     -> User Aggregator (Silero VAD) -> Google Gemini LLM (Function Calling)
-    -> ElevenLabs TTS -> SmallWebRTC Output -> Assistant Aggregator
+    -> AssistantEventsObserver -> ElevenLabs TTS -> SmallWebRTC Output -> BotSpeakingObserver
+    -> Assistant Aggregator
     """
     validate_voice_configuration(settings)
     session_state = state or VoiceConversationState()
     system_prompt = build_system_prompt()
-    tools = build_voice_tools(session_state)
+    tools = build_voice_tools(session_state, on_event=on_event)
 
     transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection,
@@ -135,7 +254,9 @@ def build_voice_pipeline(
         ),
     )
 
-    transcript_observer = UserTurnTranscriptObserver(session_state)
+    transcript_observer = UserTurnTranscriptObserver(session_state, on_event=on_event)
+    assistant_observer = AssistantEventsObserver(on_event=on_event)
+    bot_speaking_observer = BotSpeakingObserver(on_event=on_event)
 
     pipeline = Pipeline(
         [
@@ -144,8 +265,10 @@ def build_voice_pipeline(
             transcript_observer,
             context_aggregator.user(),
             llm,
+            assistant_observer,
             tts,
             transport.output(),
+            bot_speaking_observer,
             context_aggregator.assistant(),
         ]
     )

@@ -39,7 +39,34 @@ class VoiceSessionRecord:
     connection: SmallWebRTCConnection | None = None
     runner_task: asyncio.Task | None = None
     pipeline_task: object | None = None
+    transcript: list[dict] = field(default_factory=list)
     error: str | None = None
+
+    def record_and_emit_event(self, payload: dict) -> None:
+        """Persist transcript entries (deduplicated by ID) and forward over WebRTC DataChannel."""
+        if payload.get("type") == "transcript" and payload.get("id"):
+            entry_id = payload["id"]
+            existing_idx = next(
+                (idx for idx, item in enumerate(self.transcript) if item.get("id") == entry_id),
+                None,
+            )
+            entry = {
+                "id": entry_id,
+                "role": payload.get("role"),
+                "text": payload.get("text", ""),
+                "final": bool(payload.get("final", False)),
+                "timestamp": payload.get("timestamp"),
+            }
+            if existing_idx is not None:
+                self.transcript[existing_idx] = entry
+            else:
+                self.transcript.append(entry)
+
+        if self.connection is not None:
+            try:
+                self.connection.send_app_message(payload)
+            except Exception:
+                logger.debug("Unable to send WebRTC app message for session %s", self.session_id)
 
 
 class VoiceSessionManager:
@@ -96,6 +123,7 @@ class VoiceSessionManager:
             "pending_phone_confirmation": record.state.pending_phone_number is not None
             and record.state.confirmed_phone_number is None,
             "pending_cancellation_id": record.state.pending_cancellation_id,
+            "transcript": list(record.transcript),
             "error": record.error,
         }
 
@@ -124,13 +152,14 @@ class VoiceSessionManager:
         )
 
         async def on_webrtc_connection(webrtc_connection: SmallWebRTCConnection):
+            record.connection = webrtc_connection
+            record.pc_id = webrtc_connection.pc_id
             bundle = build_voice_pipeline(
                 webrtc_connection=webrtc_connection,
                 settings=self._settings,
                 state=record.state,
+                on_event=record.record_and_emit_event,
             )
-            record.connection = webrtc_connection
-            record.pc_id = webrtc_connection.pc_id
             record.pipeline_task = bundle.task
             self._pc_to_session[webrtc_connection.pc_id] = record.session_id
 

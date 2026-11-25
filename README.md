@@ -1,8 +1,6 @@
 # MediVoice AI — Voice-Based Doctor Appointment Assistant
 
-MediVoice AI is a healthcare appointment assistant built with a decoupled **Next.js (JavaScript JSX)** frontend and a **Python FastAPI** backend. It provides SQLite-backed doctor schedules, dynamic slot generation, transactional booking/cancellation APIs, and a **Pipecat** real-time voice agent using **SmallWebRTC**, **ElevenLabs STT/TTS**, and **Google Gemini** function calling.
-
-> **Current Status:** **Phase 1–4 Complete (Backend Voice Pipeline & APIs Ready; Frontend Redesign in Phase 5)**.
+MediVoice AI is a full-stack healthcare appointment assistant built with a **Next.js (JavaScript JSX + Tailwind CSS)** dashboard and a **Python FastAPI** backend. It includes SQLite appointment scheduling, dynamic slot generation, transactional booking/cancellation APIs, and a real-time **Pipecat** voice agent powered by **SmallWebRTC**, **ElevenLabs STT/TTS**, and **Google Gemini** function calling.
 
 ---
 
@@ -15,18 +13,22 @@ MediVoiceAI/
 │   │   ├── app/
 │   │   │   ├── globals.css
 │   │   │   ├── layout.js
-│   │   │   └── page.js           # Phase 1 clinical dashboard & live backend health view
+│   │   │   └── page.js           # Clinical dashboard + sidebar + persistent WebRTC audio
 │   │   ├── components/
-│   │   │   ├── BackendHealthCard.jsx
+│   │   │   ├── AppointmentsSection.jsx
+│   │   │   ├── DoctorsSection.jsx
 │   │   │   ├── Navbar.jsx
-│   │   │   └── PhaseRoadmap.jsx
+│   │   │   ├── Sidebar.jsx
+│   │   │   ├── SummaryCards.jsx
+│   │   │   └── VoiceAssistantCard.jsx
+│   │   ├── hooks/
+│   │   │   └── useVoiceCall.js   # Browser RTCPeerConnection, DataChannel & audio meter
 │   │   └── lib/
-│   │       └── api.js
+│   │       └── api.js            # Reusable REST & WebRTC signaling client
 │   ├── .env.example
 │   └── package.json
 ├── backend/                      # Python FastAPI + SQLAlchemy + Pipecat Voice Agent
 │   ├── app/
-│   │   ├── __init__.py
 │   │   ├── config.py             # Environment variable loader (pydantic-settings)
 │   │   ├── database.py           # SQLite engine, PRAGMA foreign_keys, SessionLocal
 │   │   ├── main.py               # FastAPI app, lifespan DB seed & voice shutdown
@@ -41,14 +43,13 @@ MediVoiceAI/
 │   │   │   ├── availability.py   # Dynamic 24-hour slot generation
 │   │   │   └── appointment_service.py # Shared appointment logic (FastAPI + Pipecat)
 │   │   └── voice/
-│   │       ├── __init__.py
-│   │       ├── agent.py          # Pipecat Pipeline, Silero VAD, Gemini, ElevenLabs
+│   │       ├── agent.py          # Pipecat Pipeline, Transcript Observers, Gemini, ElevenLabs
 │   │       ├── prompts.py        # Voice-optimized clinical system prompt
 │   │       ├── session.py        # SmallWebRTCRequestHandler & session manager
-│   │       └── tools.py          # Gemini function-calling tools & confirmation state
+│   │       └── tools.py          # Gemini tools & explicit confirmation state machine
 │   ├── tests/
 │   │   ├── test_appointments.py  # Phase 3 appointment API & DB tests (11 tests)
-│   │   └── test_voice_agent.py   # Phase 4 voice tool, state gate & mocked pipeline tests
+│   │   └── test_voice_agent.py   # Phase 4/5 voice tool, confirmation & pipeline tests
 │   ├── .env.example
 │   ├── requirements.txt
 │   └── run.py
@@ -62,50 +63,26 @@ MediVoiceAI/
 
 ---
 
-## Voice Architecture (Phase 4)
+## Installation
 
-The backend uses **Pipecat `1.17.0`** with **`SmallWebRTCTransport`** (`aiortc`) to stream bidirectional browser audio without requiring an external third-party SFU service:
+### 1. Backend Dependencies (Python `3.11+`, tested on `3.14.3`)
 
-```text
-Browser Microphone (WebRTC Audio)
-  -> SmallWebRTCTransport.input()
-  -> ElevenLabsRealtimeSTTService (scribe_v2_realtime)
-  -> UserTurnTranscriptObserver (tracks real caller turns for confirmation gates)
-  -> LLMContextAggregatorPair.user() + SileroVADAnalyzer
-  -> GoogleLLMService (Gemini + ToolsSchema function calling)
-  -> ElevenLabsTTSService (eleven_flash_v2_5)
-  -> SmallWebRTCTransport.output()
-  -> Browser Speaker (WebRTC Audio)
+```powershell
+cd D:\MediVoiceAI\backend
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-### Browser-to-Pipecat Signaling Flow
+### 2. Frontend Dependencies (Node.js)
 
-1. `GET /api/voice/status` — Checks whether `GEMINI_API_KEY`, `ELEVENLABS_API_KEY`, and `ELEVENLABS_VOICE_ID` are configured (returns non-secret readiness info).
-2. `POST /api/voice/sessions` — Pre-registers a voice session ID and returns ICE server configuration (returns HTTP `503` if API keys are missing).
-3. `POST /api/voice/offer` — Accepts the browser's WebRTC SDP offer (`sdp`, `type`, optional `pc_id` / `session_id`), starts the Pipecat pipeline, and returns the WebRTC SDP answer.
-4. `PATCH /api/voice/offer` — Accepts trickle ICE candidates (`pc_id`, `candidates`).
-5. `POST /api/voice/sessions/{session_id}/end` — Cancels the Pipecat `PipelineTask` and closes the WebRTC peer connection.
-
-### Gemini Function Calling & Confirmation Enforcement
-
-Gemini can invoke 7 tools defined in `backend/app/voice/tools.py`:
-- `list_doctors`
-- `check_doctor_availability`
-- `confirm_phone_number`
-- `book_appointment`
-- `list_appointments`
-- `confirm_cancellation`
-- `cancel_appointment`
-
-All appointment operations call the Phase 3 functions in `backend/app/services/appointment_service.py` directly—no business logic is duplicated.
-
-To prevent Gemini from skipping safety steps, **`VoiceConversationState`** enforces both confirmations in Python code:
-1. **Phone-Number Confirmation Gate:** Calling `book_appointment`, `list_appointments`, or `cancel_appointment` without a confirmed phone number in session state is blocked. `confirm_phone_number` first stages the normalized E.164 number and returns a digit-by-digit readback; only after a subsequent caller speech turn (`UserTurnTranscriptObserver`) and explicit confirmation does the state unlock.
-2. **Cancellation Confirmation Gate:** Cancelling requires both a confirmed caller phone number and a two-step appointment confirmation (`confirm_cancellation`) that stages the appointment details for readback and waits for explicit caller approval on a subsequent turn.
+```powershell
+cd D:\MediVoiceAI\frontend
+npm install
+```
 
 ---
 
-## Required API Keys & `.env` Setup
+## Environment Configuration
 
 1. Copy the template files (never commit `.env` or `.env.local`):
 
@@ -114,50 +91,83 @@ To prevent Gemini from skipping safety steps, **`VoiceConversationState`** enfor
    Copy-Item frontend\.env.example frontend\.env.local
    ```
 
-2. Set these required variables in `.env` (or `backend/.env`):
-   - `GEMINI_API_KEY` — Google Gemini API key (used by `GoogleLLMService`)
-   - `ELEVENLABS_API_KEY` — ElevenLabs API key (used by `ElevenLabsRealtimeSTTService` and `ElevenLabsTTSService`)
-   - `ELEVENLABS_VOICE_ID` — ElevenLabs voice ID for assistant speech output
+2. Set your backend credentials in `D:\MediVoiceAI\.env`:
+   - `GEMINI_API_KEY` — Google Gemini API key
+   - `ELEVENLABS_API_KEY` — ElevenLabs API key (used for both STT & TTS)
+   - `ELEVENLABS_VOICE_ID` — ElevenLabs voice ID for spoken assistant responses
+   - `GEMINI_MODEL` — Optional (default: `gemini-2.5-flash`)
+   - `VOICE_ICE_SERVERS` — Optional STUN/TURN URLs (default: `stun:stun.l.google.com:19302`)
 
-   Optional voice configuration:
-   - `GEMINI_MODEL` (default: `gemini-2.5-flash`)
-   - `VOICE_ICE_SERVERS` (default: `stun:stun.l.google.com:19302`)
-
-If any required credential is missing or still a placeholder, `/api/voice/sessions` and `/api/voice/offer` return a clear `503` JSON error rather than crashing.
+3. Set `NEXT_PUBLIC_API_URL=http://localhost:8000` in `D:\MediVoiceAI\frontend\.env.local`. Never place Gemini or ElevenLabs API keys in `NEXT_PUBLIC_*` variables.
 
 ---
 
-## Running the Applications & Tests
+## Starting Both Servers & Opening the Dashboard
 
-### Start the Python Backend (Port `8000`)
+Run in **two terminals**:
 
+**Terminal 1 — FastAPI Backend (`http://localhost:8000`):**
 ```powershell
 cd D:\MediVoiceAI\backend
 .\.venv\Scripts\python.exe run.py
 ```
 
-- Swagger UI: `http://localhost:8000/docs`
-- Health endpoint: `http://localhost:8000/health`
-- Voice readiness: `http://localhost:8000/api/voice/status`
-
-### Start the Next.js Frontend (Port `3000`)
-
+**Terminal 2 — Next.js Frontend (`http://localhost:3000`):**
 ```powershell
 cd D:\MediVoiceAI\frontend
 npm run dev
 ```
 
-### Run Automated Backend Tests
+Open `http://localhost:3000` in Chrome, Edge, or Firefox to use the dashboard:
+- **Dashboard:** Overview cards, live Voice Assistant card, doctors directory, and phone-number appointment lookup.
+- **Find Doctors:** Filter by speciality and click any doctor to check real-time 24-hour slot availability by date.
+- **My Appointments:** Demo mode without login — enter your phone number (e.g. `+919876543210`) to view appointments and cancel booked visits with explicit phone confirmation.
+- **Voice Assistant:** Full-view WebRTC call interface with mute/unmute, call duration, real microphone level meter, and live caller/assistant transcripts.
+
+---
+
+## WebRTC Connection & Transcript Architecture
+
+1. Clicking **Start Call** requests browser microphone access (`navigator.mediaDevices.getUserMedia`)—never on page load.
+2. Frontend calls `POST /api/voice/sessions` to verify backend credentials and obtain `session_id` + ICE servers.
+3. `useVoiceCall.js` creates an `RTCPeerConnection`, attaches the microphone track, opens a WebRTC DataChannel (`medivoice`), creates an SDP offer, and sends it to `POST /api/voice/offer` (plus trickle ICE via `PATCH /api/voice/offer`).
+4. Pipecat's `SmallWebRTCTransport` streams bidirectional audio through:
+   `ElevenLabsRealtimeSTTService` → `UserTurnTranscriptObserver` → `SileroVADAnalyzer` → `GoogleLLMService` (with 7 appointment tools) → `AssistantEventsObserver` → `ElevenLabsTTSService` → `BotSpeakingObserver` → browser `<audio>` element.
+5. `UserTurnTranscriptObserver` and `AssistantEventsObserver` push deduplicated transcript and speaking-activity JSON messages over the WebRTC DataChannel (with `GET /api/voice/sessions/{session_id}` fallback), and emit `appointment_updated` after bookings/cancellations so the dashboard refreshes automatically.
+6. Clicking **End Call** (or leaving the page) closes `RTCPeerConnection`, stops local microphone tracks, and calls `POST /api/voice/sessions/{session_id}/end`.
+
+### Browser Microphone Requirements
+
+- Browsers allow `getUserMedia` microphone access only on **secure contexts**: `http://localhost:3000` or `https://...` (not `http://<lan-ip>:3000`).
+- Grant microphone permission when prompted by your browser.
+
+---
+
+## Confirmation Security Safeguards
+
+In `backend/app/voice/tools.py`, `VoiceConversationState` enforces both confirmation gates in Python code:
+- **Phone Confirmation:** `book_appointment`, `list_appointments`, and `cancel_appointment` cannot execute until `confirm_phone_number` stages the normalized number for digit-by-digit readback AND a subsequent non-empty caller transcript (`UserTurnTranscriptObserver`) matches an explicit affirmative (`is_explicit_affirmative`) without negative/hesitation words. Unrelated questions, silence, rejections, or Gemini passing `caller_confirmed=true` alone are rejected. Speaking a different phone number resets confirmation.
+- **Cancellation Confirmation:** Requires both a confirmed caller phone number and a staged appointment readback followed by a *new* explicit affirmative caller utterance before calling `appointment_service.cancel_appointment(..., phone_number_confirmed=True)`.
+
+---
+
+## Running Automated Tests
 
 ```powershell
 cd D:\MediVoiceAI\backend
 .\.venv\Scripts\python.exe -m pytest -v
 ```
 
+```powershell
+cd D:\MediVoiceAI\frontend
+npm run lint
+npm run build
+```
+
 ---
 
-## Real vs. Mocked / Credential-Gated Integrations
+## Known Limitations
 
-- **Real & Verified:** FastAPI REST APIs, SQLite + SQLAlchemy models/constraints, 6 seeded doctors, dynamic slot availability, transactional booking/cancellation, phone-confirmation and cancellation-confirmation state enforcement, and missing-credential `503` handling.
-- **Mocked in Automated Tests:** External `GoogleLLMService`, `ElevenLabsRealtimeSTTService`, `ElevenLabsTTSService`, `SileroVADAnalyzer`, and `SmallWebRTCTransport` calls are mocked in `backend/tests/test_voice_agent.py` so no paid external API calls are made during tests.
-- **Requires Credentials & Browser UI (Phase 5):** Live browser-to-Pipecat audio streaming requires valid `GEMINI_API_KEY`, `ELEVENLABS_API_KEY`, and `ELEVENLABS_VOICE_ID` values in `.env`, plus the Phase 5 frontend WebRTC client UI (planned next).
+- **Demo Phone Lookup:** Appointments have no login/OTP; callers identify themselves by speaking or entering their phone number.
+- **In-Memory Voice Sessions:** Active WebRTC session records are stored in backend process memory (`VoiceSessionManager`).
+- **Automated Test Mocking:** `test_voice_agent.py` mocks external Gemini, ElevenLabs, and WebRTC transport calls; live audio calls require valid backend credentials and an interactive browser microphone session.

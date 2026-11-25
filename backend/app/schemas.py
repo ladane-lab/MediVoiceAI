@@ -200,6 +200,16 @@ class VoiceIcePatchRequest(BaseModel):
     candidates: list[IceCandidatePayload]
 
 
+class VoiceTranscriptEntry(BaseModel):
+    """Single caller or assistant transcript entry recorded in a voice session."""
+
+    id: str
+    role: Literal["user", "assistant"]
+    text: str
+    final: bool = True
+    timestamp: str | None = None
+
+
 class VoiceSessionStateSummary(BaseModel):
     """Sanitized confirmation state summary for a voice session."""
 
@@ -210,6 +220,7 @@ class VoiceSessionStateSummary(BaseModel):
     phone_confirmed: bool
     pending_phone_confirmation: bool
     pending_cancellation_id: int | None = None
+    transcript: list[VoiceTranscriptEntry] = Field(default_factory=list)
     error: str | None = None
 
 

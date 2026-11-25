@@ -1,6 +1,7 @@
 """Gemini function-calling tools with code-enforced confirmation state."""
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import re
 from typing import Any
@@ -22,10 +23,30 @@ from app.services.appointment_service import (
     normalize_phone_number,
 )
 
-REJECTION_PATTERN = re.compile(
-    r"\b(no|nope|wrong|incorrect|not right|nah|mistake|change it|repeat)\b",
+NEGATIVE_OR_HESITATION_PATTERN = re.compile(
+    r"\b(no|nope|nah|not|wrong|incorrect|mistake|change|repeat|wait|hold on|stop|don't|dont|do not|never mind|nevermind|instead)\b",
     re.IGNORECASE,
 )
+
+AFFIRMATIVE_PATTERN = re.compile(
+    r"\b(yes|yeah|yep|yup|correct|right|confirm|confirmed|sure|okay|ok|proceed|go ahead|please do|do it|cancel it|that is right|that's right|thats right|that is correct|that's correct|thats correct|haan|ha|sahi|bilkul|theek hai)\b",
+    re.IGNORECASE,
+)
+
+PHONE_CANDIDATE_PATTERN = re.compile(r"(?:\+?\d[\d\s()-]{8,18}\d)")
+
+
+def is_explicit_affirmative(utterance: str) -> bool:
+    """
+    Return True only when the caller uttered a clear affirmative response
+    without any negative, hesitation, or correction words.
+    """
+    cleaned = utterance.strip()
+    if not cleaned:
+        return False
+    if NEGATIVE_OR_HESITATION_PATTERN.search(cleaned):
+        return False
+    return bool(AFFIRMATIVE_PATTERN.search(cleaned))
 
 
 def format_phone_digit_by_digit(normalized_phone: str) -> str:
@@ -42,33 +63,58 @@ class VoiceConversationState:
     Per-call state machine enforcing caller confirmation gates in Python code.
 
     Gemini cannot skip phone confirmation or cancellation confirmation because
-    tool execution checks this state before invoking Phase 3 write/lookup services.
+    tool execution requires both a staged readback AND an explicit affirmative
+    caller transcript recorded after that readback.
     """
 
     turn_index: int = 0
     last_user_utterance: str = ""
+    last_user_turn_index: int = 0
 
     pending_phone_number: str | None = None
     pending_phone_turn: int | None = None
     confirmed_phone_number: str | None = None
+    phone_confirmed_turn: int | None = None
 
     pending_cancellation_id: int | None = None
     pending_cancellation_turn: int | None = None
     confirmed_cancellation_id: int | None = None
 
     def record_user_turn(self, utterance: str) -> None:
-        """Advance conversation turn when the caller speaks."""
-        self.turn_index += 1
-        self.last_user_utterance = utterance.strip()
+        """Advance conversation turn when non-empty caller speech arrives."""
+        cleaned = utterance.strip()
+        if not cleaned:
+            return
 
-        # If caller explicitly rejects during an active confirmation step, reset gates.
-        if REJECTION_PATTERN.search(self.last_user_utterance):
+        self.turn_index += 1
+        self.last_user_utterance = cleaned
+        self.last_user_turn_index = self.turn_index
+
+        # If caller explicitly rejects or hesitates, clear active pending gates.
+        if NEGATIVE_OR_HESITATION_PATTERN.search(cleaned):
             if self.pending_phone_number and not self.confirmed_phone_number:
                 self.pending_phone_number = None
                 self.pending_phone_turn = None
             if self.pending_cancellation_id and not self.confirmed_cancellation_id:
                 self.pending_cancellation_id = None
                 self.pending_cancellation_turn = None
+
+        # If caller speaks a different phone number, invalidate prior confirmations.
+        if self.confirmed_phone_number:
+            match = PHONE_CANDIDATE_PATTERN.search(cleaned)
+            if match:
+                try:
+                    spoken_normalized = normalize_phone_number(match.group(0))
+                except AppointmentServiceError:
+                    spoken_normalized = None
+                if spoken_normalized and spoken_normalized != self.confirmed_phone_number:
+                    self.confirmed_phone_number = None
+                    self.phone_confirmed_turn = None
+                    self.pending_phone_number = None
+                    self.pending_phone_turn = None
+                    self.pending_cancellation_id = None
+                    self.pending_cancellation_turn = None
+                    self.confirmed_cancellation_id = None
 
     def is_phone_confirmed(self, normalized_phone: str) -> bool:
         """Return True only when the exact normalized phone number is confirmed."""
@@ -99,6 +145,7 @@ class VoiceConversationState:
         self.pending_phone_number = normalized
         self.pending_phone_turn = self.turn_index
         self.confirmed_phone_number = None
+        self.phone_confirmed_turn = None
         # Changing caller phone invalidates any prior cancellation approval.
         self.pending_cancellation_id = None
         self.pending_cancellation_turn = None
@@ -117,7 +164,10 @@ class VoiceConversationState:
         }
 
     def confirm_phone(self, raw_phone: str, caller_confirmed: bool) -> dict[str, Any]:
-        """Confirm a staged phone number only after a subsequent caller turn."""
+        """
+        Confirm a staged phone number only when grounded in an explicit
+        affirmative caller transcript after digit-by-digit readback.
+        """
         normalized = normalize_phone_number(raw_phone)
 
         if not caller_confirmed:
@@ -133,7 +183,7 @@ class VoiceConversationState:
         if self.pending_phone_number != normalized or self.pending_phone_turn is None:
             return self.stage_phone_number(normalized)
 
-        if self.turn_index <= self.pending_phone_turn:
+        if self.last_user_turn_index <= self.pending_phone_turn:
             spoken_digits = format_phone_digit_by_digit(normalized)
             return {
                 "success": False,
@@ -146,17 +196,32 @@ class VoiceConversationState:
                 ),
             }
 
-        if REJECTION_PATTERN.search(self.last_user_utterance):
+        if NEGATIVE_OR_HESITATION_PATTERN.search(self.last_user_utterance):
             self.pending_phone_number = None
             self.pending_phone_turn = None
             self.confirmed_phone_number = None
+            self.phone_confirmed_turn = None
             return {
                 "success": False,
                 "confirmed": False,
                 "message": "Caller indicated the phone number was incorrect. Ask them to repeat it.",
             }
 
+        if not is_explicit_affirmative(self.last_user_utterance):
+            spoken_digits = format_phone_digit_by_digit(normalized)
+            return {
+                "success": False,
+                "confirmed": False,
+                "phone_number": normalized,
+                "digit_by_digit": spoken_digits,
+                "message": (
+                    f"Caller has not explicitly confirmed {spoken_digits}. "
+                    "Ask them to say yes or confirm if the number is correct."
+                ),
+            }
+
         self.confirmed_phone_number = normalized
+        self.phone_confirmed_turn = self.last_user_turn_index
         return {
             "success": True,
             "confirmed": True,
@@ -183,7 +248,10 @@ class VoiceConversationState:
         }
 
     def confirm_cancellation(self, appointment_id: int, caller_confirmed: bool) -> dict[str, Any]:
-        """Approve cancellation only after appointment details were read back and confirmed."""
+        """
+        Approve cancellation only when appointment details were read back and
+        followed by an explicit affirmative caller response.
+        """
         if not caller_confirmed:
             self.confirmed_cancellation_id = None
             return {
@@ -202,7 +270,7 @@ class VoiceConversationState:
                 ),
             }
 
-        if self.turn_index <= self.pending_cancellation_turn:
+        if self.last_user_turn_index <= self.pending_cancellation_turn:
             return {
                 "success": False,
                 "cancellation_confirmed": False,
@@ -212,7 +280,7 @@ class VoiceConversationState:
                 ),
             }
 
-        if REJECTION_PATTERN.search(self.last_user_utterance):
+        if NEGATIVE_OR_HESITATION_PATTERN.search(self.last_user_utterance):
             self.pending_cancellation_id = None
             self.pending_cancellation_turn = None
             self.confirmed_cancellation_id = None
@@ -220,6 +288,16 @@ class VoiceConversationState:
                 "success": False,
                 "cancellation_confirmed": False,
                 "message": "Caller declined cancellation. Keep the appointment booked.",
+            }
+
+        if not is_explicit_affirmative(self.last_user_utterance):
+            return {
+                "success": False,
+                "cancellation_confirmed": False,
+                "message": (
+                    "Caller has not explicitly confirmed cancellation. "
+                    "Ask them to clearly confirm with yes before cancelling."
+                ),
             }
 
         self.confirmed_cancellation_id = appointment_id
@@ -424,6 +502,12 @@ def tool_confirm_cancellation(
         )
 
     if state.pending_cancellation_id != appt_id:
+        if caller_confirmed and NEGATIVE_OR_HESITATION_PATTERN.search(state.last_user_utterance):
+            return {
+                "success": False,
+                "cancellation_confirmed": False,
+                "message": "Caller declined cancellation. Keep the appointment booked.",
+            }
         return state.stage_cancellation(appt_id, appt)
 
     return state.confirm_cancellation(appt_id, bool(caller_confirmed))
@@ -493,6 +577,7 @@ def tool_cancel_appointment(
 def build_voice_tools(
     state: VoiceConversationState,
     db_session_factory=SessionLocal,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> ToolsSchema:
     """Create Pipecat FunctionSchemas bound to the session's confirmation state."""
 
@@ -502,6 +587,10 @@ def build_voice_tools(
             return fn(db=db, **kwargs)
         finally:
             db.close()
+
+    def _emit(payload: dict[str, Any]) -> None:
+        if on_event is not None:
+            on_event(payload)
 
     async def handle_list_doctors(params: FunctionCallParams):
         args = dict(params.arguments or {})
@@ -544,6 +633,14 @@ def build_voice_tools(
             appointment_time=args.get("appointment_time", ""),
             patient_name=args.get("patient_name"),
         )
+        if result.get("success"):
+            _emit(
+                {
+                    "type": "appointment_updated",
+                    "action": "booked",
+                    "appointment": result.get("appointment"),
+                }
+            )
         await params.result_callback(result)
 
     async def handle_list_appointments(params: FunctionCallParams):
@@ -577,6 +674,14 @@ def build_voice_tools(
             appointment_id=args.get("appointment_id"),
             patient_phone_number=args.get("patient_phone_number", ""),
         )
+        if result.get("success"):
+            _emit(
+                {
+                    "type": "appointment_updated",
+                    "action": "cancelled",
+                    "appointment_id": result.get("appointment_id"),
+                }
+            )
         await params.result_callback(result)
 
     schemas = [

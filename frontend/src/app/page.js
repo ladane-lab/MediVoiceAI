@@ -1,72 +1,122 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { Stethoscope, Cpu, AudioLines, Database } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import Sidebar from "@/components/Sidebar";
 import Navbar from "@/components/Navbar";
-import BackendHealthCard from "@/components/BackendHealthCard";
-import PhaseRoadmap from "@/components/PhaseRoadmap";
-import { fetchBackendHealth, getApiBaseUrl } from "@/lib/api";
-
-const STACK_PILLARS = [
-  {
-    title: "Frontend Interface",
-    value: "Next.js · React · Tailwind",
-    icon: Stethoscope,
-  },
-  {
-    title: "Voice & WebRTC",
-    value: "Pipecat · ElevenLabs STT/TTS",
-    icon: AudioLines,
-  },
-  {
-    title: "Clinical Reasoning",
-    value: "Google Gemini LLM",
-    icon: Cpu,
-  },
-  {
-    title: "Backend & Storage",
-    value: "FastAPI · SQLite",
-    icon: Database,
-  },
-];
+import SummaryCards from "@/components/SummaryCards";
+import VoiceAssistantCard from "@/components/VoiceAssistantCard";
+import DoctorsSection from "@/components/DoctorsSection";
+import AppointmentsSection from "@/components/AppointmentsSection";
+import useVoiceCall from "@/hooks/useVoiceCall";
+import {
+  fetchAppointments,
+  fetchBackendHealth,
+  fetchDoctors,
+  fetchVoiceStatus,
+} from "@/lib/api";
 
 export default function Home() {
-  const [health, setHealth] = useState(null);
-  const [error, setError] = useState("");
-  const [isChecking, setIsChecking] = useState(true);
+  const [activeTab, setActiveTab] = useState("dashboard");
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const apiUrl = getApiBaseUrl();
+  const [isBackendOnline, setIsBackendOnline] = useState(false);
+  const [isCheckingBackend, setIsCheckingBackend] = useState(true);
+  const [voiceStatus, setVoiceStatus] = useState(null);
 
-  const handleRefresh = useCallback(async () => {
-    setIsChecking(true);
-    setError("");
+  const [doctors, setDoctors] = useState([]);
+  const [doctorsLoading, setDoctorsLoading] = useState(true);
+  const [doctorsError, setDoctorsError] = useState("");
+  const [availabilityRefreshTick, setAvailabilityRefreshTick] = useState(0);
+
+  const [lookupPhone, setLookupPhone] = useState("");
+  const [appointments, setAppointments] = useState([]);
+  const [appointmentsLoading, setAppointmentsLoading] = useState(false);
+  const [appointmentsError, setAppointmentsError] = useState("");
+
+  const loadDoctors = useCallback(async () => {
+    setDoctorsLoading(true);
+    setDoctorsError("");
     try {
-      const data = await fetchBackendHealth();
-      setHealth(data);
+      const data = await fetchDoctors();
+      setDoctors(data.doctors || []);
     } catch (err) {
-      setHealth(null);
-      setError(err instanceof Error ? err.message : "Connection failed");
+      setDoctorsError(err.message || "Unable to load doctors.");
     } finally {
-      setIsChecking(false);
+      setDoctorsLoading(false);
     }
   }, []);
+
+  const loadAppointments = useCallback(async (phone) => {
+    const cleaned = (phone || "").trim();
+    if (!cleaned) {
+      setAppointments([]);
+      setAppointmentsError("");
+      return;
+    }
+
+    setAppointmentsLoading(true);
+    setAppointmentsError("");
+    try {
+      const data = await fetchAppointments({ patientPhoneNumber: cleaned });
+      setAppointments(data.appointments || []);
+    } catch (err) {
+      setAppointments([]);
+      setAppointmentsError(err.message || "Unable to load appointments.");
+    } finally {
+      setAppointmentsLoading(false);
+    }
+  }, []);
+
+  const handleVoiceAppointmentUpdated = useCallback(
+    (event) => {
+      setAvailabilityRefreshTick((prev) => prev + 1);
+      const bookedPhone = event?.appointment?.patient_phone_number;
+      const phoneToQuery = bookedPhone || lookupPhone;
+      if (bookedPhone && !lookupPhone) {
+        setLookupPhone(bookedPhone);
+      }
+      if (phoneToQuery) {
+        loadAppointments(phoneToQuery);
+      }
+    },
+    [loadAppointments, lookupPhone],
+  );
+
+  const remoteAudioRef = useRef(null);
+
+  const voiceCall = useVoiceCall({
+    remoteAudioRef,
+    onAppointmentUpdated: handleVoiceAppointmentUpdated,
+  });
 
   useEffect(() => {
     let active = true;
 
-    fetchBackendHealth()
-      .then((data) => {
+    Promise.allSettled([fetchBackendHealth(), fetchVoiceStatus(), fetchDoctors()])
+      .then(([healthRes, voiceRes, docsRes]) => {
         if (!active) return;
-        setHealth(data);
-        setError("");
-      })
-      .catch((err) => {
-        if (!active) return;
-        setHealth(null);
-        setError(err instanceof Error ? err.message : "Connection failed");
+
+        if (healthRes.status === "fulfilled") {
+          setIsBackendOnline(healthRes.value?.status === "ok");
+        } else {
+          setIsBackendOnline(false);
+        }
+
+        if (voiceRes.status === "fulfilled") {
+          setVoiceStatus(voiceRes.value);
+        }
+
+        if (docsRes.status === "fulfilled") {
+          setDoctors(docsRes.value?.doctors || []);
+          setDoctorsError("");
+        } else {
+          setDoctorsError(docsRes.reason?.message || "Unable to load doctors.");
+        }
       })
       .finally(() => {
-        if (active) setIsChecking(false);
+        if (!active) return;
+        setIsCheckingBackend(false);
+        setDoctorsLoading(false);
       });
 
     return () => {
@@ -74,69 +124,151 @@ export default function Home() {
     };
   }, []);
 
+  function handleLookupSubmit(phone) {
+    const cleaned = phone.trim();
+    setLookupPhone(cleaned);
+    loadAppointments(cleaned);
+  }
+
+  function handleStartCallFromDoctor() {
+    setActiveTab("voice");
+    if (
+      voiceCall.status === "idle" ||
+      voiceCall.status === "ended" ||
+      voiceCall.status === "error"
+    ) {
+      voiceCall.startCall();
+    }
+  }
+
   return (
-    <div className="flex min-h-screen flex-col bg-slate-50">
-      <Navbar isConnected={Boolean(health)} isChecking={isChecking} />
+    <div className="flex min-h-screen bg-slate-50 text-[#0F2942]">
+      {/* Persistent remote audio element so active WebRTC audio continues across tab switches */}
+      <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
 
-      <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6 lg:px-8">
-        {/* Hero Overview Banner */}
-        <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs sm:p-8">
-          <div className="max-w-3xl">
-            <span className="inline-flex items-center rounded-full bg-[#0F2942]/5 px-3 py-1 text-xs font-semibold text-[#0F2942]">
-              Healthcare SaaS Workspace · Phase 1 Setup
-            </span>
-            <h1 className="mt-3 text-2xl font-semibold tracking-tight text-[#0F2942] sm:text-3xl">
-              MediVoice AI — Voice-Based Doctor Appointment Assistant
-            </h1>
-            <p className="mt-2.5 text-sm leading-relaxed text-slate-600 sm:text-base">
-              Phase 1 establishes the decoupled frontend and Python backend
-              foundation. Appointment scheduling flows and the real-time Pipecat
-              WebRTC voice assistant will be connected in subsequent phases.
-            </p>
-          </div>
+      <Sidebar
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
+        voiceCallStatus={voiceCall.status}
+        mobileOpen={mobileMenuOpen}
+        onCloseMobile={() => setMobileMenuOpen(false)}
+      />
 
-          <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            {STACK_PILLARS.map((item) => {
-              const Icon = item.icon;
-              return (
-                <div
-                  key={item.title}
-                  className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-4 transition-colors hover:border-teal-200 hover:bg-teal-50/20"
-                >
-                  <div className="flex items-center gap-2 text-teal-700">
-                    <Icon className="h-4 w-4" />
-                    <span className="text-xs font-medium text-slate-500">
-                      {item.title}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <Navbar
+          activeTab={activeTab}
+          isBackendOnline={isBackendOnline}
+          isCheckingBackend={isCheckingBackend}
+          isVoiceReady={Boolean(voiceStatus?.ready)}
+          onOpenMobileMenu={() => setMobileMenuOpen(true)}
+        />
+
+        <main className="mx-auto w-full max-w-7xl flex-1 space-y-6 px-4 py-6 sm:px-6 lg:px-8">
+          {activeTab === "dashboard" ? (
+            <>
+              {/* Welcome Banner */}
+              <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
+                <div className="flex flex-wrap items-center justify-between gap-4">
+                  <div className="max-w-2xl">
+                    <span className="inline-flex items-center rounded-full bg-teal-50 px-3 py-1 text-xs font-semibold text-teal-700">
+                      Voice-Based Appointment Assistant
                     </span>
+                    <h2 className="mt-2.5 text-xl font-semibold tracking-tight text-[#0F2942] sm:text-2xl">
+                      Welcome to MediVoice AI
+                    </h2>
+                    <p className="mt-1.5 text-sm text-slate-600">
+                      Speak naturally with MediVoice AI over WebRTC to check doctor
+                      availability, book appointments, or cancel existing bookings.
+                    </p>
                   </div>
-                  <p className="mt-1.5 text-sm font-semibold text-[#0F2942]">
-                    {item.value}
-                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("doctors")}
+                      className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-medium text-[#0F2942] hover:bg-slate-50"
+                    >
+                      Browse Doctors
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("appointments")}
+                      className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-medium text-[#0F2942] hover:bg-slate-50"
+                    >
+                      Lookup by Phone
+                    </button>
+                  </div>
                 </div>
-              );
-            })}
-          </div>
-        </section>
+              </section>
 
-        {/* Health Check + Phase Roadmap */}
-        <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
-          <BackendHealthCard
-            apiUrl={apiUrl}
-            health={health}
-            error={error}
-            isChecking={isChecking}
-            onRefresh={handleRefresh}
-          />
-          <PhaseRoadmap />
-        </div>
-      </main>
+              <SummaryCards
+                doctorsCount={doctorsLoading ? null : doctors.length}
+                voiceReady={Boolean(voiceStatus?.ready)}
+                callStatus={voiceCall.status}
+                appointments={appointments}
+                lookupPhone={lookupPhone}
+              />
 
-      <footer className="border-t border-slate-200/80 bg-white py-4">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-2 px-4 text-xs text-slate-500 sm:px-6 lg:px-8">
-          <span>MediVoice AI · Phase 1 Foundation</span>
-          <span>Next.js (JSX) + FastAPI + Pipecat Architecture</span>
-        </div>
-      </footer>
+              <VoiceAssistantCard voiceCall={voiceCall} voiceStatus={voiceStatus} />
+
+              <DoctorsSection
+                doctors={doctors}
+                isLoading={doctorsLoading}
+                error={doctorsError}
+                onRefresh={loadDoctors}
+                availabilityRefreshTick={availabilityRefreshTick}
+                onStartVoiceCall={handleStartCallFromDoctor}
+              />
+
+              <AppointmentsSection
+                lookupPhone={lookupPhone}
+                appointments={appointments}
+                isLoading={appointmentsLoading}
+                error={appointmentsError}
+                onLookupSubmit={handleLookupSubmit}
+                onRefresh={() => loadAppointments(lookupPhone)}
+                onAfterCancel={async () => {
+                  await loadAppointments(lookupPhone);
+                  setAvailabilityRefreshTick((prev) => prev + 1);
+                }}
+              />
+            </>
+          ) : null}
+
+          {activeTab === "doctors" ? (
+            <DoctorsSection
+              doctors={doctors}
+              isLoading={doctorsLoading}
+              error={doctorsError}
+              onRefresh={loadDoctors}
+              availabilityRefreshTick={availabilityRefreshTick}
+              onStartVoiceCall={handleStartCallFromDoctor}
+            />
+          ) : null}
+
+          {activeTab === "appointments" ? (
+            <AppointmentsSection
+              lookupPhone={lookupPhone}
+              appointments={appointments}
+              isLoading={appointmentsLoading}
+              error={appointmentsError}
+              onLookupSubmit={handleLookupSubmit}
+              onRefresh={() => loadAppointments(lookupPhone)}
+              onAfterCancel={async () => {
+                await loadAppointments(lookupPhone);
+                setAvailabilityRefreshTick((prev) => prev + 1);
+              }}
+            />
+          ) : null}
+
+          {activeTab === "voice" ? (
+            <VoiceAssistantCard
+              voiceCall={voiceCall}
+              voiceStatus={voiceStatus}
+              expanded
+            />
+          ) : null}
+        </main>
+      </div>
     </div>
   );
 }
